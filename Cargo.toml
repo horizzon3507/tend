@@ -1,0 +1,34 @@
+[package]
+name = "tend"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Tends the machine: scans dead weight, cleans safely, backs up dotfiles, and watches resources"
+authors = ["horizzon3507 <148660626+horizzon3507@users.noreply.github.com>"]
+license = "Apache-2.0"
+readme = "README.md"
+keywords = ["cli", "disk", "cleanup", "dotfiles", "backup"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "tend"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+ctrlc = "3"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tar = "0.4"
+zstd = "0.13"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
