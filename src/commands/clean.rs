@@ -1,6 +1,7 @@
 use std::fs;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -8,10 +9,14 @@ use serde_json::{Value, json};
 use crate::cli::CleanArgs;
 use crate::commands;
 use crate::config;
+use crate::history;
 use crate::scan::{ScanOptions, build_report};
 use crate::targets::{self, Target};
 use crate::ui;
-use crate::util::{human_bytes, tildify};
+use crate::util::{human_bytes, now_ms, parse_size, tildify};
+
+/// The human plan prints at most this many rows; the deletion plan itself is complete.
+const DISPLAY_CAP: usize = 24;
 
 /// Double guard: the name must still be a known target AND the path must sit inside
 /// one of the scanned roots. Nothing gets deleted on the strength of a stale report.
@@ -35,8 +40,80 @@ fn is_eligible(path: &Path, target: &Target, roots: &[PathBuf]) -> bool {
     })
 }
 
+/// Active `--older-than` / `--min-size` filters. The cutoff is computed once so a
+/// long walk cannot drift while it runs.
+struct Filters {
+    older_than_days: Option<i64>,
+    min_size: Option<u64>,
+    cutoff_ms: Option<i64>,
+}
+
+impl Filters {
+    fn new(older_than: Option<i64>, min_size: Option<String>) -> Result<Self> {
+        if let Some(days) = older_than {
+            if days < 0 {
+                anyhow::bail!("--older-than must be 0 or more days");
+            }
+        }
+        let min_size = match min_size.as_deref() {
+            Some(raw) => Some(parse_size(raw).ok_or_else(|| {
+                anyhow::anyhow!("invalid --min-size: {raw} (expected e.g. 100MB)")
+            })?),
+            None => None,
+        };
+        Ok(Filters {
+            older_than_days: older_than,
+            min_size,
+            cutoff_ms: older_than.map(|days| now_ms() - days.saturating_mul(86_400_000)),
+        })
+    }
+
+    /// Applies both filters to one finding. A directory with an unreadable mtime is
+    /// skipped: the safer outcome when the user asked for "old enough".
+    fn retains(&self, path: &Path, bytes: u64) -> bool {
+        if let Some(min) = self.min_size {
+            if bytes < min {
+                return false;
+            }
+        }
+        if let Some(cutoff) = self.cutoff_ms {
+            let Some(modified) = modified_ms(path) else {
+                return false;
+            };
+            if modified > cutoff {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn labels(&self) -> Vec<String> {
+        let mut labels = Vec::new();
+        if let Some(days) = self.older_than_days {
+            labels.push(format!("older than {days} days"));
+        }
+        if let Some(min) = self.min_size {
+            labels.push(format!("at least {}", human_bytes(min)));
+        }
+        labels
+    }
+}
+
+fn modified_ms(path: &Path) -> Option<i64> {
+    let modified = fs::metadata(path).and_then(|meta| meta.modified()).ok()?;
+    modified
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|since| since.as_millis() as i64)
+}
+
 fn confirm(question: &str) -> bool {
-    if !std::io::stdin().is_terminal() {
+    confirm_with(question, std::io::stdin().is_terminal())
+}
+
+/// Split out so the non-interactive refusal is testable without touching real stdin.
+fn confirm_with(question: &str, interactive: bool) -> bool {
+    if !interactive {
         return false;
     }
     print!("{question}");
@@ -55,33 +132,44 @@ pub fn run(args: CleanArgs) -> Result<i32> {
         return Ok(1);
     };
 
+    let filters = Filters::new(args.older_than, args.min_size.clone())?;
+
     let depth = args.common.depth.unwrap_or(config.max_depth);
-    let limit = args.limit.unwrap_or(400);
     let include_unsafe = args.all;
 
     let report = build_report(&ScanOptions {
         roots: roots.clone(),
+        exclude: config
+            .exclude
+            .iter()
+            .map(|entry| crate::util::expand_home(entry))
+            .collect(),
         depth,
         stale_days: config.stale_days,
         safe_only: !include_unsafe,
-        limit,
+        limit: usize::MAX,
         repos: false,
         links: false,
         measure_dirs: false,
+        progress: false,
     });
 
     let eligible: Vec<_> = report
         .findings
         .iter()
         .filter(|finding| is_eligible(&finding.path, finding.target, &roots))
+        .filter(|finding| filters.retains(&finding.path, finding.bytes))
         .collect();
     let total: u64 = eligible.iter().map(|finding| finding.bytes).sum();
+    let filter_labels = filters.labels();
 
     if args.common.json {
         let document = json!({
             "roots": roots.iter().map(|root| root.display().to_string()).collect::<Vec<_>>(),
             "apply": args.apply,
             "truncated": report.truncated,
+            "olderThan": args.older_than,
+            "minSize": args.min_size,
             "total": total,
             "items": eligible.iter().map(|finding| json!({
                 "path": finding.path.display().to_string(),
@@ -126,6 +214,7 @@ pub fn run(args: CleanArgs) -> Result<i32> {
         }
 
         let (removed, freed, errors) = delete_all(&eligible, true);
+        history::record("clean", &roots, removed, freed, errors.len());
         let code = if errors.is_empty() { 0 } else { 1 };
         emit(Some((removed, freed, &errors)))?;
         return Ok(code);
@@ -152,9 +241,12 @@ pub fn run(args: CleanArgs) -> Result<i32> {
             ),
         );
         ui::kv("space", &ui::bold(&human_bytes(total)));
+        if !filter_labels.is_empty() {
+            ui::kv("filters", &filter_labels.join(" · "));
+        }
         ui::blank();
 
-        let shown: Vec<_> = eligible.iter().take(24).collect();
+        let shown: Vec<_> = eligible.iter().take(DISPLAY_CAP).collect();
         let max = shown.first().map(|finding| finding.bytes).unwrap_or(1);
         for finding in &shown {
             let relative = if max > 0 {
@@ -177,9 +269,9 @@ pub fn run(args: CleanArgs) -> Result<i32> {
             );
         }
         if eligible.len() > shown.len() {
-            ui::say_note(&format!(
-                "  ... {} more items",
-                eligible.len() - shown.len()
+            ui::say_warn(&format!(
+                "showing the {DISPLAY_CAP} largest of {} items; the full plan is used for deletion",
+                eligible.len()
             ));
         }
         if !report.protected_paths.is_empty() {
@@ -187,9 +279,6 @@ pub fn run(args: CleanArgs) -> Result<i32> {
                 "  {} tool installs left out (not project caches)",
                 report.protected_paths.len()
             ));
-        }
-        if report.truncated {
-            ui::say_warn("scan capped, raise with --limit");
         }
         ui::blank();
     }
@@ -219,6 +308,7 @@ pub fn run(args: CleanArgs) -> Result<i32> {
     }
 
     let (removed, freed, errors) = delete_all(&eligible, false);
+    history::record("clean", &roots, removed, freed, errors.len());
     ui::blank();
     ui::say_ok(&format!(
         "{removed} directories removed, {} freed",
@@ -258,4 +348,46 @@ fn delete_all(eligible: &[&crate::scan::Finding], quiet: bool) -> (usize, u64, V
     }
 
     (removed, freed, errors)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn non_interactive_confirmation_refuses() {
+        assert!(!confirm_with("delete? ", false));
+    }
+
+    #[test]
+    fn rejects_negative_age_and_bad_sizes() {
+        assert!(Filters::new(Some(-1), None).is_err());
+        assert!(Filters::new(None, Some("ten megabytes".to_string())).is_err());
+        assert!(Filters::new(Some(0), Some("512k".to_string())).is_ok());
+    }
+
+    #[test]
+    fn min_size_skips_smaller_findings() {
+        let filters = Filters::new(None, Some("1MB".to_string())).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!filters.retains(tmp.path(), 512));
+        assert!(filters.retains(tmp.path(), 2 * 1024 * 1024));
+    }
+
+    #[test]
+    fn older_than_skips_fresh_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fresh = tmp.path().join("fresh");
+        fs::create_dir(&fresh).unwrap();
+
+        assert!(!Filters::new(Some(7), None).unwrap().retains(&fresh, 4096));
+        assert!(Filters::new(Some(0), None).unwrap().retains(&fresh, 4096));
+    }
+
+    #[test]
+    fn unreadable_mtime_is_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let filters = Filters::new(Some(1), None).unwrap();
+        assert!(!filters.retains(&tmp.path().join("gone"), 4096));
+    }
 }
