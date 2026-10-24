@@ -56,6 +56,31 @@ pub fn human_bytes(bytes: u64) -> String {
     format!("{} {}", text, UNITS[unit])
 }
 
+/// Parses "10MB", "1.5G", "512k", or a raw byte count.
+pub fn parse_size(input: &str) -> Option<u64> {
+    let text = input.trim().to_ascii_lowercase();
+    if text.is_empty() {
+        return None;
+    }
+    let split = text
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(text.len());
+    let (number, unit) = text.split_at(split);
+    let value: f64 = number.parse().ok()?;
+    if !value.is_finite() || value < 0.0 {
+        return None;
+    }
+    let multiplier = match unit.trim() {
+        "" | "b" => 1f64,
+        "k" | "kb" | "kib" => 1024f64,
+        "m" | "mb" | "mib" => 1024f64.powi(2),
+        "g" | "gb" | "gib" => 1024f64.powi(3),
+        "t" | "tb" | "tib" => 1024f64.powi(4),
+        _ => return None,
+    };
+    Some((value * multiplier).round() as u64)
+}
+
 const MINUTE: i64 = 60_000;
 const HOUR: i64 = 60 * MINUTE;
 const DAY: i64 = 24 * HOUR;
