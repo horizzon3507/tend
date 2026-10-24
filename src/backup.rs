@@ -1,7 +1,9 @@
+use std::ffi::CString;
 use std::fs::{self, File};
 use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -286,6 +288,40 @@ pub fn create(options: &CreateOptions) -> Result<CreateResult> {
     })
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerifyResult {
+    pub manifest_id: String,
+    pub archive: String,
+    pub expected: Option<String>,
+    pub actual: String,
+    pub bytes: u64,
+    pub ok: bool,
+}
+
+/// Rehashes the archive on disk and compares it with the manifest digest. The
+/// archive itself is never rewritten.
+pub fn verify(manifest: &Manifest) -> Result<VerifyResult> {
+    let Some(expected) = manifest.sha256.as_deref() else {
+        bail!("manifest has no sha256");
+    };
+
+    let archive = PathBuf::from(&manifest.archive);
+    if !archive.exists() {
+        bail!("archive not found: {}", manifest.archive);
+    }
+
+    let actual = sha256_file(&archive)?;
+    Ok(VerifyResult {
+        manifest_id: manifest.id.clone(),
+        archive: manifest.archive.clone(),
+        expected: Some(expected.to_string()),
+        actual: actual.clone(),
+        bytes: fs::metadata(&archive).map(|meta| meta.len()).unwrap_or(0),
+        ok: actual.eq_ignore_ascii_case(expected),
+    })
+}
+
 pub fn archive_entries(archive: &Path, limit: usize) -> Result<Vec<String>> {
     let file = File::open(archive)?;
     let decoder = zstd::Decoder::new(file)?;
@@ -300,6 +336,55 @@ pub fn archive_entries(archive: &Path, limit: usize) -> Result<Vec<String>> {
         names.push(entry.path()?.to_string_lossy().into_owned());
     }
     Ok(names)
+}
+
+/// tar cannot keep directory timestamps while extracting: writing children
+/// touches the parent. Reapply the stored stamps deepest-first afterwards.
+fn reapply_dir_mtimes(archive: &Path, target: &Path) {
+    let Ok(file) = File::open(archive) else {
+        return;
+    };
+    let Ok(decoder) = zstd::Decoder::new(file) else {
+        return;
+    };
+    let mut tar = tar::Archive::new(decoder);
+    let Ok(entries) = tar.entries() else {
+        return;
+    };
+
+    let mut dirs: Vec<(PathBuf, u64)> = Vec::new();
+    for entry in entries.flatten() {
+        let header = entry.header();
+        if !header.entry_type().is_dir() {
+            continue;
+        }
+        let Ok(path) = entry.path() else {
+            continue;
+        };
+        let path = path.into_owned();
+        if path.is_absolute() || path.components().any(|part| part == Component::ParentDir) {
+            continue;
+        }
+        dirs.push((path, header.mtime().unwrap_or(0)));
+    }
+
+    dirs.sort_by_key(|(path, _)| std::cmp::Reverse(path.components().count()));
+
+    for (relative, mtime) in dirs {
+        let path = target.join(relative);
+        let Ok(cpath) = CString::new(path.as_os_str().as_bytes()) else {
+            continue;
+        };
+        let stamp = libc::timespec {
+            tv_sec: mtime as libc::time_t,
+            tv_nsec: 0,
+        };
+        let times = [stamp, stamp];
+        // A directory that cannot be stamped is cosmetic, never a restore failure.
+        unsafe {
+            libc::utimensat(libc::AT_FDCWD, cpath.as_ptr(), times.as_ptr(), 0);
+        }
+    }
 }
 
 pub fn restore(
@@ -342,6 +427,7 @@ pub fn restore(
     tar.set_preserve_mtime(true);
     tar.unpack(&target)
         .with_context(|| format!("could not extract to {}", target.display()))?;
+    reapply_dir_mtimes(&archive, &target);
 
     Ok((target.display().to_string(), entries.len()))
 }
@@ -570,5 +656,83 @@ mod tests {
         let kept = list_backups(&dest);
         assert_eq!(kept.len(), 2);
         assert!(kept[0].created_at >= kept[1].created_at);
+    }
+
+    fn set_mtime(path: &Path, secs: i64) {
+        let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        let stamp = libc::timespec {
+            tv_sec: secs as libc::time_t,
+            tv_nsec: 0,
+        };
+        let times = [stamp, stamp];
+        let result = unsafe { libc::utimensat(libc::AT_FDCWD, cpath.as_ptr(), times.as_ptr(), 0) };
+        assert_eq!(result, 0, "could not stamp {}", path.display());
+    }
+
+    #[test]
+    fn verify_accepts_a_fresh_backup_and_catches_a_corrupted_one() {
+        let dir = sandbox();
+        let paths = sources(dir.path());
+        let dest = dir.path().join("backups");
+        let created = create(&options(&dest, &paths, 5, false)).unwrap();
+
+        let clean = verify(&created.manifest).unwrap();
+        assert!(clean.ok);
+        assert_eq!(clean.expected, created.manifest.sha256);
+        assert_eq!(clean.actual, created.manifest.sha256.clone().unwrap());
+        assert_eq!(clean.bytes, created.manifest.bytes);
+
+        let archive = PathBuf::from(&created.manifest.archive);
+        let mut bytes = fs::read(&archive).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+        fs::write(&archive, &bytes).unwrap();
+
+        let damaged = verify(&created.manifest).unwrap();
+        assert!(!damaged.ok);
+        assert_ne!(damaged.actual, damaged.expected.unwrap());
+    }
+
+    #[test]
+    fn verify_refuses_a_manifest_without_a_digest() {
+        let dir = sandbox();
+        let paths = sources(dir.path());
+        let dest = dir.path().join("backups");
+        let created = create(&options(&dest, &paths, 5, false)).unwrap();
+
+        let mut manifest = created.manifest;
+        manifest.sha256 = None;
+        let error = verify(&manifest).unwrap_err().to_string();
+        assert!(error.contains("no sha256"), "error was: {error}");
+    }
+
+    #[test]
+    fn restored_directories_keep_their_source_mtime() {
+        let dir = sandbox();
+        let stamped = dir.path().join("home/.config/app");
+        fs::create_dir_all(&stamped).unwrap();
+        fs::write(stamped.join("conf.toml"), "theme = \"dark\"\n").unwrap();
+        let known = 1_600_000_000i64;
+        set_mtime(&stamped, known);
+
+        let paths = sources(dir.path());
+        let dest = dir.path().join("backups");
+        let created = create(&options(&dest, &paths, 5, false)).unwrap();
+
+        let restored = dir.path().join("restored");
+        restore(
+            &created.manifest,
+            Some(&restored.display().to_string()),
+            false,
+            false,
+        )
+        .unwrap();
+
+        let copy = restored.join(stamped.strip_prefix("/").unwrap());
+        let got = fs::metadata(&copy).unwrap().mtime();
+        assert!(
+            (got - known).abs() <= 1,
+            "restored mtime {got} differs from source {known}"
+        );
     }
 }
