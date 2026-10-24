@@ -1,6 +1,6 @@
 [package]
-name = "tend"
-version = "0.1.0"
+name = "tend-cli"
+version = "0.2.0-beta"
 edition = "2024"
 rust-version = "1.85"
 description = "Tends the machine: scans dead weight, cleans safely, backs up dotfiles, and watches resources"
@@ -17,6 +17,8 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
+clap_mangen = "0.2"
 ctrlc = "3"
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
