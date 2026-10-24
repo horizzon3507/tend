@@ -18,6 +18,11 @@ pub fn run(args: StatusArgs) -> Result<i32> {
     let depth = args.common.depth.unwrap_or(config.max_depth).min(3);
     let report = build_report(&ScanOptions {
         roots: roots.clone(),
+        exclude: config
+            .exclude
+            .iter()
+            .map(|entry| crate::util::expand_home(entry))
+            .collect(),
         depth,
         stale_days: config.stale_days,
         safe_only: true,
@@ -25,6 +30,7 @@ pub fn run(args: StatusArgs) -> Result<i32> {
         repos: false,
         links: true,
         measure_dirs: true,
+        progress: false,
     });
 
     let backups = backup::list_backups(&config::backup_dest(&config, None));
@@ -45,8 +51,9 @@ pub fn run(args: StatusArgs) -> Result<i32> {
                     "bytes": entry.bytes,
                 })).collect::<Vec<_>>(),
                 "reclaimable": report.reclaimable_safe,
-                "targets": report.findings.len(),
-                "brokenLinks": report.broken_links.len(),
+                "targets": report.total_findings,
+                "brokenLinks": report.links_total,
+                "linksCapped": report.links_capped,
                 "protectedPaths": report.protected_paths.len(),
                 "backups": backups.len(),
                 "lastBackup": last.map(|manifest| manifest.created_at),
@@ -110,7 +117,7 @@ pub fn run(args: StatusArgs) -> Result<i32> {
     };
     ui::kv("backup", &backup_text);
 
-    let link_text = format!("{} broken", report.broken_links.len());
+    let link_text = format!("{} broken", report.links_total);
     ui::kv(
         "links",
         &if report.broken_links.is_empty() {

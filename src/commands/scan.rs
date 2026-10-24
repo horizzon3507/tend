@@ -22,6 +22,11 @@ pub fn run(args: ScanArgs) -> Result<i32> {
 
     let report = build_report(&ScanOptions {
         roots: roots.clone(),
+        exclude: config
+            .exclude
+            .iter()
+            .map(|entry| crate::util::expand_home(entry))
+            .collect(),
         depth,
         stale_days,
         safe_only: true,
@@ -29,6 +34,7 @@ pub fn run(args: ScanArgs) -> Result<i32> {
         repos: true,
         links: true,
         measure_dirs: true,
+        progress: true,
     });
 
     if args.common.json {
@@ -204,14 +210,19 @@ fn render_repos(report: &Report) {
 }
 
 fn render_links(report: &Report) {
-    if report.broken_links.is_empty() {
+    if report.links_total == 0 {
         return;
     }
-    ui::section("broken links", Some(&report.broken_links.len().to_string()));
+    ui::section("broken links", Some(&report.links_total.to_string()));
     for link in report.broken_links.iter().take(12) {
         ui::bullet(&tildify(link), 2);
     }
-    if report.broken_links.len() > 12 {
+    if report.links_total > report.broken_links.len() {
+        ui::say_note(&format!(
+            "  ... {} more links (only 40 paths retained)",
+            report.links_total - report.broken_links.len()
+        ));
+    } else if report.broken_links.len() > 12 {
         ui::say_note(&format!(
             "  ... {} more links",
             report.broken_links.len() - 12
