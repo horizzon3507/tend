@@ -19,6 +19,9 @@ pub struct Config {
     pub max_depth: usize,
     #[serde(rename = "staleDays")]
     pub stale_days: i64,
+    /// paths that scanning and cleanup must never enter
+    #[serde(default)]
+    pub exclude: Vec<String>,
     pub backup: BackupConfig,
 }
 
@@ -28,6 +31,7 @@ impl Default for Config {
             roots: vec!["~".to_string()],
             max_depth: 4,
             stale_days: 180,
+            exclude: Vec::new(),
             backup: BackupConfig {
                 paths: [
                     "~/.bashrc",
