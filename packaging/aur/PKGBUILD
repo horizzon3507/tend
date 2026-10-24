@@ -14,7 +14,7 @@ _tag="v0.2.0-beta"
 # pkgver cannot contain a hyphen, so it uses "_beta" while the tag keeps "v0.2.0-beta".
 source=("$url/archive/refs/tags/$_tag.tar.gz")
 # Replace SKIP with the real checksum when the tag is published: updpkgsums.
-sha256sums=('SKIP')
+sha256sums=('e32bd3e1e6f54aa7b454ba8965df20ce1efaa097eee1f65f05ae284e43ba03f6')
 
 build() {
   cd "tend-${_tag#v}"
