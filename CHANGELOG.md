@@ -29,6 +29,23 @@ We only call something **stable** when we mean it.
 
 </details>
 
+## v0.2.0-beta · 24/10/2026
+
+Safety, correctness, and observability release. This version was made for CLI with a beta release channel on 24/10/2026 (v0.2.0-beta).
+
+- Scanning and cleanup no longer enter `~/.cache` looking for targets; docker, journald, and cache reporting is read-only.
+- `~/.gradle`, `~/.m2`, and `~/.android` are protected from cleanup.
+- `projects --apply` no longer auto-confirms on non-interactive stdin; it requires `--yes`.
+- Totals and reclaimable bytes are computed before any display limit, so `--limit` never shrinks them; broken-link counts are exact, with at most 40 paths printed.
+- `clean --older-than DAYS --min-size SIZE` and the same filters on `projects`.
+- `projects --depth N` searches nested projects; `exclude` in the config skips path prefixes across scan, status, clean, and projects.
+- `tend check` (exit 2 at `--max-usage`), `tend history`, `tend space`, `tend completions <shell>`, and `tend man`.
+- `tend backup verify [id]` checks the manifest SHA-256; `--in-place` restore takes a pre-restore snapshot and directory mtimes are reapplied.
+- Parallel scanning with progress on stderr.
+- Cargo package renamed to `tend-cli`; the binary stays `tend`, and the release tag is `v0.2.0-beta`.
+- CI (fmt, clippy, tests), a musl release workflow, and an AUR source-build PKGBUILD.
+- Various other small tweaks
+
 ## v0.1.0-beta · 17/10/2026
 
 First cut of `tend`, the caretaker CLI rewritten in Rust from the old `zelador` (Bun + TypeScript). This version was made for CLI with a beta release channel on 17/10/2026 (v0.1.0-beta).
