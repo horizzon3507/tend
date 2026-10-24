@@ -1,22 +1,44 @@
 use std::collections::HashSet;
 use std::fs;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 use anyhow::Result;
 use clap::Args;
 use serde_json::json;
 
+use crate::history;
 use crate::scan::subtree_bytes;
 use crate::targets::is_protected;
 use crate::ui;
-use crate::util::{expand_home, human_bytes, is_tty, tildify};
+use crate::util::{expand_home, human_bytes, is_tty, now_ms, parse_size, tildify};
+
+/// Directory names that are artifacts or VCS metadata; discovery never descends
+/// into them, so a `target/` cannot contribute a bogus nested project.
+const NO_DESCEND: &[&str] = &[
+    "target",
+    "node_modules",
+    ".next",
+    "dist",
+    "build",
+    "__pycache__",
+    ".venv",
+    "venv",
+    ".git",
+];
+
+const NON_INTERACTIVE_REFUSAL: &str = "refusing to delete without --yes on a non-interactive stdin";
 
 #[derive(Args, Debug, Clone)]
 pub struct ProjectsArgs {
-    /// directory whose immediate children are scanned for projects (default: current directory)
+    /// directory whose children are scanned for projects (default: current directory)
     #[arg(value_name = "PATH", default_value = ".")]
     pub path: PathBuf,
+
+    /// how many directory levels below PATH to search
+    #[arg(long, value_name = "N", default_value_t = 1)]
+    pub depth: usize,
 
     /// only consider these artifact kinds (comma-separated, e.g. --only target,node_modules)
     #[arg(long, value_name = "KINDS")]
@@ -30,9 +52,17 @@ pub struct ProjectsArgs {
     #[arg(long)]
     pub all: bool,
 
-    /// only consider the project whose name contains this string
+    /// only consider projects whose name contains this string
     #[arg(long, value_name = "NAME")]
     pub project: Option<String>,
+
+    /// only consider artifacts older than this many days
+    #[arg(long = "older-than", value_name = "DAYS")]
+    pub older_than: Option<i64>,
+
+    /// only consider artifacts at least this large (e.g. 100MB)
+    #[arg(long = "min-size", value_name = "SIZE")]
+    pub min_size: Option<String>,
 
     /// actually delete (default is a dry run that deletes nothing)
     #[arg(long)]
@@ -181,35 +211,69 @@ fn is_project(dir: &Path) -> bool {
     MARKERS.iter().any(|marker| dir.join(marker).exists())
 }
 
-/// Immediate child directories of `root` that look like projects. Symlinked
-/// children are skipped so a link can never pull a scan outside the root.
-fn discover_projects(root: &Path, name_filter: Option<&str>) -> Vec<PathBuf> {
-    let Ok(entries) = fs::read_dir(root) else {
-        return Vec::new();
-    };
+/// Paths equal to or below any configured exclude, resolved the same way as `PATH`.
+fn is_excluded(path: &Path, excludes: &[PathBuf]) -> bool {
+    excludes
+        .iter()
+        .any(|exclude| path == exclude || path.starts_with(exclude))
+}
+
+/// Breadth-first walk up to `depth` levels below `root`. A marked directory is a
+/// project and the walk still descends through it, so nested projects are found
+/// too; artifact directories, `.git`, protected tool installs, excluded paths,
+/// and symlinks are never entered.
+fn discover_projects(
+    root: &Path,
+    depth: usize,
+    name_filter: Option<&str>,
+    excludes: &[PathBuf],
+) -> Vec<PathBuf> {
     let needle = name_filter.map(|name| name.to_ascii_lowercase());
     let mut projects = Vec::new();
-    for entry in entries.flatten() {
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        if !file_type.is_dir() {
-            continue;
+    let mut seen = HashSet::new();
+    let mut frontier = vec![root.to_path_buf()];
+
+    for _ in 0..depth {
+        if frontier.is_empty() {
+            break;
         }
-        let path = entry.path();
-        if is_protected(&path) {
-            continue;
-        }
-        if let Some(needle) = &needle {
-            let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
-            if !name.contains(needle) {
+        let mut next = Vec::new();
+        for dir in &frontier {
+            let Ok(entries) = fs::read_dir(dir) else {
                 continue;
+            };
+            for entry in entries.flatten() {
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                // `file_type` does not follow links, so symlinked directories are skipped.
+                if !file_type.is_dir() {
+                    continue;
+                }
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if NO_DESCEND.iter().any(|skip| *skip == &*name) {
+                    continue;
+                }
+                let path = entry.path();
+                if is_protected(&path) || is_excluded(&path, excludes) {
+                    continue;
+                }
+                if is_project(&path) {
+                    let matches = match &needle {
+                        Some(needle) => name.to_ascii_lowercase().contains(needle),
+                        None => true,
+                    };
+                    if matches && seen.insert(path.clone()) {
+                        projects.push(path.clone());
+                    }
+                }
+                next.push(path);
             }
         }
-        if is_project(&path) {
-            projects.push(path);
-        }
+        frontier = next;
     }
+
     projects.sort();
     projects
 }
@@ -217,12 +281,12 @@ fn discover_projects(root: &Path, name_filter: Option<&str>) -> Vec<PathBuf> {
 /// Measures one artifact directory without following symlinks: a symlinked
 /// `target/` counts as the link itself and is never traversed, so sizes and
 /// later deletions stay inside the project.
-fn measure_dir(path: &Path) -> Option<DirEntry> {
+fn measure_dir(path: &Path, excludes: &[PathBuf]) -> Option<DirEntry> {
     let meta = fs::symlink_metadata(path).ok()?;
     if meta.file_type().is_symlink() || !meta.is_dir() {
         return None;
     }
-    if is_protected(path) {
+    if is_protected(path) || is_excluded(path, excludes) {
         return None;
     }
     Some(DirEntry {
@@ -231,13 +295,13 @@ fn measure_dir(path: &Path) -> Option<DirEntry> {
     })
 }
 
-fn measure_project(project: &Path) -> Vec<KindEntry> {
+fn measure_project(project: &Path, excludes: &[PathBuf]) -> Vec<KindEntry> {
     let mut found = Vec::new();
     for def in KINDS {
         let mut dirs = Vec::new();
         for name in def.dirs {
             let candidate = project.join(name);
-            if let Some(entry) = measure_dir(&candidate) {
+            if let Some(entry) = measure_dir(&candidate, excludes) {
                 dirs.push(entry);
             }
         }
@@ -255,7 +319,85 @@ fn measure_project(project: &Path) -> Vec<KindEntry> {
     found
 }
 
-fn plan_projects(args: &ProjectsArgs, root: &Path) -> anyhow::Result<Vec<ProjectPlan>> {
+/// Active `--older-than` / `--min-size` filters, parsed once per run so the cutoff
+/// cannot drift while a large tree is measured.
+struct Filters {
+    older_than_days: Option<i64>,
+    min_size: Option<u64>,
+    cutoff_ms: Option<i64>,
+}
+
+impl Filters {
+    fn new(args: &ProjectsArgs) -> anyhow::Result<Self> {
+        if let Some(days) = args.older_than {
+            if days < 0 {
+                anyhow::bail!("--older-than must be 0 or more days");
+            }
+        }
+        let min_size = match args.min_size.as_deref() {
+            Some(raw) => Some(parse_size(raw).ok_or_else(|| {
+                anyhow::anyhow!("invalid --min-size: {raw} (expected e.g. 100MB)")
+            })?),
+            None => None,
+        };
+        Ok(Filters {
+            older_than_days: args.older_than,
+            min_size,
+            cutoff_ms: args
+                .older_than
+                .map(|days| now_ms() - days.saturating_mul(86_400_000)),
+        })
+    }
+
+    /// A directory with an unreadable mtime is dropped: the safer outcome when the
+    /// user asked for artifacts that are old enough.
+    fn retains(&self, dir: &DirEntry) -> bool {
+        if let Some(min) = self.min_size {
+            if dir.bytes < min {
+                return false;
+            }
+        }
+        if let Some(cutoff) = self.cutoff_ms {
+            let Some(modified) = modified_ms(&dir.path) else {
+                return false;
+            };
+            if modified > cutoff {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn describe(&self) -> Option<String> {
+        let mut labels = Vec::new();
+        if let Some(days) = self.older_than_days {
+            labels.push(format!("older than {days} days"));
+        }
+        if let Some(min) = self.min_size {
+            labels.push(format!("at least {}", human_bytes(min)));
+        }
+        if labels.is_empty() {
+            None
+        } else {
+            Some(labels.join(" · "))
+        }
+    }
+}
+
+fn modified_ms(path: &Path) -> Option<i64> {
+    let modified = fs::metadata(path).and_then(|meta| meta.modified()).ok()?;
+    modified
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|since| since.as_millis() as i64)
+}
+
+fn plan_projects(
+    args: &ProjectsArgs,
+    root: &Path,
+    excludes: &[PathBuf],
+    filters: &Filters,
+) -> anyhow::Result<Vec<ProjectPlan>> {
     let only = args
         .only
         .as_deref()
@@ -269,21 +411,41 @@ fn plan_projects(args: &ProjectsArgs, root: &Path) -> anyhow::Result<Vec<Project
         .transpose()?
         .unwrap_or_default();
 
+    if is_excluded(root, excludes) {
+        return Ok(Vec::new());
+    }
+
     let mut plans = Vec::new();
-    for project in discover_projects(root, args.project.as_deref()) {
+    for project in discover_projects(root, args.depth, args.project.as_deref(), excludes) {
         let name = project
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| project.display().to_string());
         let mut kinds = Vec::new();
         let mut excluded = Vec::new();
-        for entry in measure_project(&project) {
+        for entry in measure_project(&project, excludes) {
+            // Kind selection first, then age/size, then the safe/unsafe split.
             if !only.is_empty() && !only.contains(entry.kind) {
                 continue;
             }
             if except.contains(entry.kind) {
                 continue;
             }
+            let dirs: Vec<DirEntry> = entry
+                .dirs
+                .into_iter()
+                .filter(|dir| filters.retains(dir))
+                .collect();
+            if dirs.is_empty() {
+                continue;
+            }
+            let bytes = dirs.iter().map(|dir| dir.bytes).sum();
+            let entry = KindEntry {
+                kind: entry.kind,
+                dirs,
+                bytes,
+                safe: entry.safe,
+            };
             if !entry.safe && !args.all {
                 excluded.push(entry);
                 continue;
@@ -324,12 +486,16 @@ fn confirm(question: &str) -> bool {
     matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
-/// One prompt for the whole run after the plan has been shown. Piped output
-/// auto-confirms so scripts never hang; a TTY requires `--yes` or an explicit
-/// `y`.
-fn confirmed(plans: &[ProjectPlan], total: u64, yes: bool) -> bool {
-    if yes || !is_tty() {
+/// One prompt for the whole run after the plan has been shown. `--yes` skips it;
+/// a non-interactive stdin is refused instead of auto-confirmed, so a piped run
+/// can never delete without an explicit `--yes`.
+fn confirmed(plans: &[ProjectPlan], total: u64, yes: bool, tty: bool) -> bool {
+    if yes {
         return true;
+    }
+    if !tty {
+        eprintln!("{}", ui::bad(NON_INTERACTIVE_REFUSAL));
+        return false;
     }
     let kinds = distinct_kinds(plans).join(", ");
     confirm(&format!(
@@ -341,10 +507,10 @@ fn confirmed(plans: &[ProjectPlan], total: u64, yes: bool) -> bool {
 
 fn emit_json(
     root: &Path,
-    apply: bool,
+    args: &ProjectsArgs,
     plans: &[ProjectPlan],
     removed: Option<(usize, u64, &[String])>,
-) -> Result<i32> {
+) -> Result<()> {
     let projects = plans
         .iter()
         .map(|plan| {
@@ -362,7 +528,10 @@ fn emit_json(
         .collect::<Vec<_>>();
     let mut document = json!({
         "path": root.display().to_string(),
-        "apply": apply,
+        "depth": args.depth,
+        "olderThan": args.older_than,
+        "minSize": args.min_size,
+        "apply": args.apply,
         "projects": projects,
     });
     let (removed_count, freed, errors) = removed.unwrap_or((0, 0, &[]));
@@ -370,22 +539,28 @@ fn emit_json(
     document["freed"] = json!(freed);
     document["errors"] = json!(errors);
     println!("{}", serde_json::to_string_pretty(&document)?);
-    Ok(0)
+    Ok(())
 }
 
-fn print_plan(root: &Path, plans: &[ProjectPlan], total: u64, include_unsafe: bool) {
+fn print_plan(
+    root: &Path,
+    args: &ProjectsArgs,
+    plans: &[ProjectPlan],
+    total: u64,
+    filters: &Filters,
+) {
     ui::section("tend", Some("projects"));
     ui::kv("root", &tildify(root));
+    ui::kv("depth", &args.depth.to_string());
+    if let Some(active) = filters.describe() {
+        ui::kv("filters", &active);
+    }
     ui::kv(
         "projects",
         &format!(
             "{} with artifacts{}",
             plans.len(),
-            if include_unsafe {
-                " (including unsafe)"
-            } else {
-                ""
-            }
+            if args.all { " (including unsafe)" } else { "" }
         ),
     );
     ui::kv("reclaimable", &ui::bold(&human_bytes(total)));
@@ -487,51 +662,72 @@ fn delete_all(plans: &[ProjectPlan], quiet: bool) -> (usize, u64, Vec<String>) {
 
 pub fn run(args: ProjectsArgs) -> Result<i32> {
     let root = resolve_root(&args.path);
+    let config = crate::config::load().config;
+    let excludes: Vec<PathBuf> = config
+        .exclude
+        .iter()
+        .map(|raw| resolve_root(Path::new(raw)))
+        .collect();
+    let filters = Filters::new(&args)?;
+
     if !root.is_dir() {
+        let error = format!("not a directory: {}", root.display());
         if args.json {
-            let document = json!({
-                "path": root.display().to_string(),
-                "apply": args.apply,
-                "projects": [],
-                "removed": 0,
-                "freed": 0,
-                "errors": [format!("not a directory: {}", root.display())],
-            });
-            println!("{}", serde_json::to_string_pretty(&document)?);
+            emit_json(&root, &args, &[], Some((0, 0, &[error])))?;
         } else {
             ui::say_fail(&format!("not a directory: {}", tildify(&root)));
         }
         return Ok(1);
     }
 
-    let plans = plan_projects(&args, &root)?;
+    let plans = plan_projects(&args, &root, &excludes, &filters)?;
     let actionable: Vec<ProjectPlan> = plans
         .into_iter()
         .filter(|plan| !plan.kinds.is_empty())
         .collect();
     let total: u64 = actionable.iter().map(|plan| plan.total).sum();
+    let interactive = is_tty() && std::io::stdin().is_terminal();
+
+    if args.apply && !args.yes && !interactive {
+        // Piped stdin cannot answer the prompt: refuse before anything is removed, even
+        // when the plan is empty, so the run is never mistaken for a successful apply.
+        if args.json {
+            emit_json(&root, &args, &actionable, Some((0, 0, &[])))?;
+        } else {
+            print_plan(&root, &args, &actionable, total, &filters);
+        }
+        eprintln!("{}", ui::bad(NON_INTERACTIVE_REFUSAL));
+        return Ok(1);
+    }
 
     if args.json {
         if !args.apply {
-            emit_json(&root, false, &actionable, None)?;
+            emit_json(&root, &args, &actionable, None)?;
             return Ok(0);
         }
         if actionable.is_empty() {
-            emit_json(&root, true, &actionable, Some((0, 0, &[])))?;
+            emit_json(&root, &args, &actionable, Some((0, 0, &[])))?;
             return Ok(0);
         }
-        if !confirmed(&actionable, total, args.yes) {
-            emit_json(&root, true, &actionable, Some((0, 0, &[])))?;
+        if !confirmed(&actionable, total, args.yes, interactive) {
+            emit_json(&root, &args, &actionable, Some((0, 0, &[])))?;
             eprintln!("cancelled, nothing was removed");
             return Ok(1);
         }
         let (removed, freed, errors) = delete_all(&actionable, true);
+        history::record(
+            "projects",
+            std::slice::from_ref(&root),
+            removed,
+            freed,
+            errors.len(),
+        );
         let code = if errors.is_empty() { 0 } else { 1 };
-        emit_json(&root, true, &actionable, Some((removed, freed, &errors)))?;
+        emit_json(&root, &args, &actionable, Some((removed, freed, &errors)))?;
         return Ok(code);
     }
 
-    print_plan(&root, &actionable, total, args.all);
+    print_plan(&root, &args, &actionable, total, &filters);
     if actionable.is_empty() {
         ui::say_note("no project artifacts found");
         return Ok(0);
@@ -549,12 +745,19 @@ pub fn run(args: ProjectsArgs) -> Result<i32> {
         "destructive mode, {} will be removed",
         ui::bold(&human_bytes(total))
     ));
-    if !confirmed(&actionable, total, args.yes) {
+    if !confirmed(&actionable, total, args.yes, interactive) {
         ui::say_fail("cancelled, nothing was removed");
         return Ok(1);
     }
 
     let (removed, freed, errors) = delete_all(&actionable, false);
+    history::record(
+        "projects",
+        std::slice::from_ref(&root),
+        removed,
+        freed,
+        errors.len(),
+    );
     ui::blank();
     ui::say_ok(&format!(
         "{removed} directories removed, {} freed",
@@ -573,14 +776,34 @@ mod tests {
     fn base_args(path: &Path) -> ProjectsArgs {
         ProjectsArgs {
             path: path.to_path_buf(),
+            depth: 1,
             only: None,
             except: None,
             all: false,
             project: None,
+            older_than: None,
+            min_size: None,
             apply: false,
             yes: true,
             json: false,
         }
+    }
+
+    fn names(paths: &[PathBuf]) -> Vec<String> {
+        paths
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn actionable(plans: &[ProjectPlan]) -> Vec<&ProjectPlan> {
+        plans.iter().filter(|plan| !plan.kinds.is_empty()).collect()
+    }
+
+    /// Plans with freshly parsed filters, mirroring what `run` does.
+    fn plan(args: &ProjectsArgs, root: &Path, excludes: &[PathBuf]) -> Vec<ProjectPlan> {
+        let filters = Filters::new(args).unwrap();
+        plan_projects(args, root, excludes, &filters).unwrap()
     }
 
     fn write_file(path: &Path, contents: &[u8]) {
@@ -621,13 +844,11 @@ mod tests {
     #[test]
     fn discovery_finds_cargo_and_node_projects() {
         let tmp = fixture();
-        let mut found = discover_projects(tmp.path(), None);
-        found.sort();
-        let names: Vec<String> = found
-            .iter()
-            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(names, vec!["rust-app".to_string(), "web".to_string()]);
+        let found = discover_projects(tmp.path(), 1, None, &[]);
+        assert_eq!(
+            names(&found),
+            vec!["rust-app".to_string(), "web".to_string()]
+        );
     }
 
     #[test]
@@ -637,7 +858,7 @@ mod tests {
             only: Some("target".to_string()),
             ..base_args(tmp.path())
         };
-        let plans = plan_projects(&args, tmp.path()).unwrap();
+        let plans = plan(&args, tmp.path(), &[]);
         let actionable: Vec<&ProjectPlan> =
             plans.iter().filter(|plan| !plan.kinds.is_empty()).collect();
         assert_eq!(actionable.len(), 1);
@@ -653,7 +874,7 @@ mod tests {
             project: Some("web".to_string()),
             ..base_args(tmp.path())
         };
-        let plans = plan_projects(&args, tmp.path()).unwrap();
+        let plans = plan(&args, tmp.path(), &[]);
         assert_eq!(plans.len(), 1);
         assert_eq!(plans[0].name, "web");
     }
@@ -697,7 +918,7 @@ mod tests {
         );
 
         let root = tmp.path();
-        let without_all = plan_projects(&base_args(root), root).unwrap();
+        let without_all = plan(&base_args(root), root, &[]);
         assert!(without_all.iter().all(|plan| plan.kinds.is_empty()));
         assert!(
             without_all
@@ -709,12 +930,118 @@ mod tests {
             all: true,
             ..base_args(root)
         };
-        let with_all = plan_projects(&args, root).unwrap();
+        let with_all = plan(&args, root, &[]);
         let actionable: Vec<&ProjectPlan> = with_all
             .iter()
             .filter(|plan| !plan.kinds.is_empty())
             .collect();
         assert_eq!(actionable.len(), 1);
         assert!(actionable[0].kinds.iter().any(|entry| entry.kind == "venv"));
+    }
+
+    #[test]
+    fn nested_project_needs_matching_depth() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inner = tmp.path().join("group").join("inner");
+        write_file(&inner.join("Cargo.toml"), b"[package]\nname = \"inner\"\n");
+        write_file(&inner.join("target").join("blob"), &[0u8; 2048]);
+
+        assert!(discover_projects(tmp.path(), 1, None, &[]).is_empty());
+
+        let deep = discover_projects(tmp.path(), 2, None, &[]);
+        assert_eq!(names(&deep), vec!["inner".to_string()]);
+
+        let shallow_args = base_args(tmp.path());
+        assert!(actionable(&plan(&shallow_args, tmp.path(), &[])).is_empty());
+
+        let deep_args = ProjectsArgs {
+            depth: 2,
+            ..base_args(tmp.path())
+        };
+        let plans = plan(&deep_args, tmp.path(), &[]);
+        assert_eq!(actionable(&plans).len(), 1);
+        assert_eq!(actionable(&plans)[0].name, "inner");
+    }
+
+    #[test]
+    fn artifact_dirs_are_never_descended() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = tmp.path().join("app");
+        write_file(&app.join("Cargo.toml"), b"[package]\nname = \"app\"\n");
+        write_file(
+            &app.join("target").join("nested").join("Cargo.toml"),
+            b"[package]\nname = \"nested\"\n",
+        );
+
+        let found = discover_projects(tmp.path(), 3, None, &[]);
+        assert_eq!(names(&found), vec!["app".to_string()]);
+    }
+
+    #[test]
+    fn excluded_projects_and_artifacts_are_skipped() {
+        let tmp = fixture();
+        let root = tmp.path();
+
+        let excludes = vec![root.join("rust-app")];
+        let plans = plan(&base_args(root), root, &excludes);
+        assert!(plans.iter().all(|plan| plan.name != "rust-app"));
+        assert!(plans.iter().any(|plan| plan.name == "web"));
+
+        let excludes = vec![root.join("web").join("node_modules")];
+        let plans = plan(&base_args(root), root, &excludes);
+        let web = plans.iter().find(|plan| plan.name == "web").unwrap();
+        assert!(web.kinds.is_empty());
+    }
+
+    #[test]
+    fn excluded_root_yields_no_plan() {
+        let tmp = fixture();
+        let excludes = vec![tmp.path().to_path_buf()];
+        let plans = plan(&base_args(tmp.path()), tmp.path(), &excludes);
+        assert!(plans.is_empty());
+    }
+
+    #[test]
+    fn min_size_skips_small_artifacts() {
+        let tmp = fixture();
+        let args = ProjectsArgs {
+            min_size: Some("1MB".to_string()),
+            ..base_args(tmp.path())
+        };
+        let plans = plan(&args, tmp.path(), &[]);
+        assert!(plans.iter().all(|plan| plan.kinds.is_empty()));
+    }
+
+    #[test]
+    fn older_than_skips_fresh_artifacts() {
+        let tmp = fixture();
+        let args = ProjectsArgs {
+            older_than: Some(7),
+            ..base_args(tmp.path())
+        };
+        let plans = plan(&args, tmp.path(), &[]);
+        assert!(plans.iter().all(|plan| plan.kinds.is_empty()));
+    }
+
+    #[test]
+    fn invalid_filters_are_rejected() {
+        let tmp = fixture();
+        let bad_size = ProjectsArgs {
+            min_size: Some("big".to_string()),
+            ..base_args(tmp.path())
+        };
+        assert!(Filters::new(&bad_size).is_err());
+
+        let negative = ProjectsArgs {
+            older_than: Some(-1),
+            ..base_args(tmp.path())
+        };
+        assert!(Filters::new(&negative).is_err());
+    }
+
+    #[test]
+    fn non_interactive_apply_requires_yes() {
+        assert!(!confirmed(&[], 0, false, false));
+        assert!(confirmed(&[], 0, true, false));
     }
 }
