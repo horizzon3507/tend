@@ -128,6 +128,9 @@ fn protected_prefixes() -> &'static Vec<PathBuf> {
             ".local/opt",
             ".omp/plugins",
             ".local/share/pnpm",
+            ".gradle",
+            ".m2",
+            ".android",
         ]
         .iter()
         .map(|suffix| home().join(suffix))
@@ -154,6 +157,17 @@ mod tests {
         ));
         assert!(is_protected(&home.join(".omp/plugins/node_modules")));
         assert!(is_protected(&home.join(".cargo/registry/src/x/target")));
+    }
+
+    #[test]
+    fn global_tool_caches_are_protected() {
+        let home = home();
+        assert!(is_protected(&home.join(".gradle")));
+        assert!(is_protected(&home.join(".m2")));
+        assert!(is_protected(&home.join(".android")));
+        assert!(is_protected(&home.join(".gradle/caches/x/node_modules")));
+        assert!(is_protected(&home.join(".m2/repository/target")));
+        assert!(is_protected(&home.join(".android/build/node_modules")));
     }
 
     #[test]
