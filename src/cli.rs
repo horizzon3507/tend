@@ -1,5 +1,6 @@
 use anyhow::Result;
 use clap::{Args, CommandFactory, Parser, Subcommand};
+use clap_complete::Shell;
 
 use crate::commands;
 use crate::ui;
@@ -39,6 +40,16 @@ pub enum Command {
     Config(ConfigArgs),
     /// clean build artifacts across the projects in a directory
     Projects(crate::commands::projects::ProjectsArgs),
+    /// check disk pressure and exit non-zero when above the threshold
+    Check(CheckArgs),
+    /// show what previous cleanup runs freed
+    History(HistoryArgs),
+    /// report space held by docker, journald, and the user cache
+    Space(SpaceArgs),
+    /// print a shell completion script
+    Completions(CompletionsArgs),
+    /// print the man page as roff
+    Man(ManArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -85,10 +96,6 @@ pub struct CleanArgs {
     #[command(flatten)]
     pub common: CommonArgs,
 
-    /// max scan items
-    #[arg(long, value_name = "N")]
-    pub limit: Option<usize>,
-
     /// include unsafe targets (dist, build, .venv)
     ///
     /// Removes regenerable build artifacts and caches: node_modules, target/,
@@ -115,6 +122,14 @@ pub struct CleanArgs {
     /// skip the confirmation prompt
     #[arg(long)]
     pub yes: bool,
+
+    /// only remove targets older than this many days
+    #[arg(long = "older-than", value_name = "DAYS")]
+    pub older_than: Option<i64>,
+
+    /// only remove targets at least this large (e.g. 100MB)
+    #[arg(long = "min-size", value_name = "SIZE")]
+    pub min_size: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -145,6 +160,48 @@ pub struct ConfigArgs {
     #[arg(long)]
     pub path: bool,
 }
+
+#[derive(Args, Debug)]
+pub struct CheckArgs {
+    #[command(flatten)]
+    pub common: CommonArgs,
+
+    /// fail when disk usage reaches this percent
+    #[arg(long = "max-usage", value_name = "PERCENT", default_value_t = 90)]
+    pub max_usage: u8,
+
+    /// print nothing; use only the exit code
+    #[arg(long)]
+    pub quiet: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct HistoryArgs {
+    /// how many entries to show
+    #[arg(long, value_name = "N", default_value_t = 20)]
+    pub limit: usize,
+
+    /// JSON output, for scripts
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct SpaceArgs {
+    /// JSON output, for scripts
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct CompletionsArgs {
+    /// shell to generate for
+    #[arg(value_enum)]
+    pub shell: Shell,
+}
+
+#[derive(Args, Debug)]
+pub struct ManArgs {}
 
 #[derive(Args, Debug)]
 pub struct BackupArgs {
@@ -195,6 +252,11 @@ pub enum BackupAction {
         /// id, id prefix, or "latest"
         reference: Option<String>,
     },
+    /// verify a snapshot against its manifest checksum
+    Verify {
+        /// id, id prefix, or "latest"
+        reference: Option<String>,
+    },
 }
 
 pub fn run(cli: Cli) -> Result<i32> {
@@ -215,5 +277,10 @@ pub fn run(cli: Cli) -> Result<i32> {
         Command::Watch(args) => commands::watch::run(args),
         Command::Config(args) => commands::config::run(args),
         Command::Projects(args) => commands::projects::run(args),
+        Command::Check(args) => commands::check::run(args),
+        Command::History(args) => commands::history::run(args),
+        Command::Space(args) => commands::space::run(args),
+        Command::Completions(args) => commands::completions::run(args),
+        Command::Man(args) => commands::man::run(args),
     }
 }

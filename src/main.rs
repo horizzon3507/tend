@@ -2,6 +2,7 @@ mod backup;
 mod cli;
 mod commands;
 mod config;
+mod history;
 mod monitor;
 mod scan;
 mod targets;
@@ -15,6 +16,13 @@ use clap::Parser;
 use crate::ui as console;
 
 fn main() -> ExitCode {
+    // Rust ignores SIGPIPE by default, which turns `tend man | head` into a panic.
+    // Standard CLI behavior is to die quietly when the reader closes the pipe.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     let raw: Vec<String> = std::env::args().collect();
 
     // `version` as a word, plus the short flag the previous build accepted.

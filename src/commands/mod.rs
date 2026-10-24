@@ -1,8 +1,13 @@
 pub mod backup;
+pub mod check;
 pub mod clean;
+pub mod completions;
 pub mod config;
+pub mod history;
+pub mod man;
 pub mod projects;
 pub mod scan;
+pub mod space;
 pub mod status;
 pub mod watch;
 
