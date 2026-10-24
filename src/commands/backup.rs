@@ -24,7 +24,8 @@ pub fn run(args: BackupArgs) -> Result<i32> {
 
     match args.action.as_ref() {
         Some(BackupAction::List) => list(&dest, args.json),
-        Some(BackupAction::Restore { reference }) => restore(&args, &dest, reference.clone()),
+        Some(BackupAction::Verify { reference }) => verify(&dest, reference.clone(), args.json),
+        Some(BackupAction::Restore { reference }) => restore(&args, &dest, keep, reference.clone()),
         _ => create(&args, &config, &dest, keep),
     }
 }
@@ -120,7 +121,7 @@ fn list(dest: &Path, json: bool) -> Result<i32> {
     Ok(0)
 }
 
-fn restore(args: &BackupArgs, dest: &Path, reference: Option<String>) -> Result<i32> {
+fn verify(dest: &Path, reference: Option<String>, json: bool) -> Result<i32> {
     let reference = reference.unwrap_or_else(|| "latest".to_string());
     let Some(manifest) = engine::resolve_backup(dest, &reference) else {
         ui::say_fail(&format!(
@@ -129,6 +130,103 @@ fn restore(args: &BackupArgs, dest: &Path, reference: Option<String>) -> Result<
         ));
         return Ok(1);
     };
+
+    let result = match engine::verify(&manifest) {
+        Ok(result) => result,
+        Err(error) => {
+            if json {
+                println!(
+                    "{}",
+                    json!({
+                        "manifest": manifest.id,
+                        "archive": manifest.archive,
+                        "expected": manifest.sha256,
+                        "actual": serde_json::Value::Null,
+                        "bytes": manifest.bytes,
+                        "ok": false,
+                        "error": error.to_string(),
+                    })
+                );
+            } else {
+                ui::say_fail(&error.to_string());
+            }
+            return Ok(1);
+        }
+    };
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(if result.ok { 0 } else { 1 });
+    }
+
+    ui::section("tend", Some(&format!("verify {}", result.manifest_id)));
+    ui::kv("archive", &tildify(Path::new(&result.archive)));
+    ui::kv("size", &human_bytes(result.bytes));
+    ui::kv(
+        "expected",
+        &ui::grey(result.expected.as_deref().unwrap_or("missing")),
+    );
+    ui::kv(
+        "actual",
+        &if result.ok {
+            ui::grey(&result.actual)
+        } else {
+            ui::bad(&result.actual)
+        },
+    );
+    ui::kv(
+        "ok",
+        &if result.ok {
+            ui::bold("yes")
+        } else {
+            ui::bad("no")
+        },
+    );
+
+    if result.ok {
+        ui::say_ok("sha256 matches, archive intact");
+        Ok(0)
+    } else {
+        ui::say_fail("sha256 mismatch, archive is corrupt or was modified");
+        Ok(1)
+    }
+}
+
+fn restore(args: &BackupArgs, dest: &Path, keep: usize, reference: Option<String>) -> Result<i32> {
+    let reference = reference.unwrap_or_else(|| "latest".to_string());
+    let Some(manifest) = engine::resolve_backup(dest, &reference) else {
+        ui::say_fail(&format!(
+            "backup \"{reference}\" not found in {}",
+            tildify(dest)
+        ));
+        return Ok(1);
+    };
+
+    let mut snapshot: Option<String> = None;
+    if args.in_place && !args.dry_run {
+        // Overwriting without a fallback is never acceptable: snapshot whatever
+        // exists right now, and abort instead of retrying. If nothing exists
+        // (recovering deleted dotfiles), there is nothing to snapshot.
+        let any_existing = manifest
+            .paths
+            .iter()
+            .any(|entry| crate::util::expand_home(entry).exists());
+        if any_existing {
+            match engine::create(&engine::CreateOptions {
+                dest,
+                paths: &manifest.paths,
+                keep,
+                force: true,
+                size_limit: u64::MAX,
+            }) {
+                Ok(result) => snapshot = Some(result.manifest.id),
+                Err(error) => {
+                    ui::say_fail(&format!("pre-restore snapshot failed: {error}"));
+                    return Ok(1);
+                }
+            }
+        }
+    }
 
     let (target, entries) =
         match engine::restore(&manifest, args.to.as_deref(), args.in_place, args.dry_run) {
@@ -147,6 +245,7 @@ fn restore(args: &BackupArgs, dest: &Path, reference: Option<String>) -> Result<
                 "target": target,
                 "entries": entries,
                 "dryRun": args.dry_run,
+                "preRestoreSnapshot": snapshot,
             })
         );
         return Ok(0);
@@ -155,6 +254,11 @@ fn restore(args: &BackupArgs, dest: &Path, reference: Option<String>) -> Result<
     ui::section("tend", Some(&format!("restore {}", manifest.id)));
     ui::kv("archive", &tildify(Path::new(&manifest.archive)));
     ui::kv("files", &entries.to_string());
+    if let Some(id) = &snapshot {
+        ui::kv("snapshot", &ui::bold(id));
+    } else if args.in_place && !args.dry_run {
+        ui::say_note("no current files to snapshot before restore");
+    }
     ui::kv(
         "target",
         &if args.in_place {
