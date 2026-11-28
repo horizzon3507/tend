@@ -34,6 +34,7 @@ pub fn run(args: SpaceArgs) -> Result<i32> {
                     "path": entry.path.display().to_string(),
                 })).collect::<Vec<_>>(),
                 "cacheTotal": cache_total,
+                "trash": crate::trash::total_bytes(),
             }))?
         );
         return Ok(0);
@@ -74,6 +75,19 @@ pub fn run(args: SpaceArgs) -> Result<i32> {
             .collect();
         ui::table(&["path", "size"], &rows);
         ui::kv("total", &human_bytes(cache_total));
+    }
+
+    let trashed = crate::trash::total_bytes();
+    if trashed > 0 {
+        ui::section("trash", None);
+        ui::kv(
+            "held",
+            &format!(
+                "{} {}",
+                human_bytes(trashed),
+                ui::dim("tend trash empty reclaims it")
+            ),
+        );
     }
 
     ui::blank();
