@@ -663,7 +663,13 @@ fn delete_all(plans: &[ProjectPlan], quiet: bool, purge: bool) -> (usize, u64, V
                 if !meta.is_dir() {
                     continue;
                 }
-                if !dir.path.starts_with(&plan.path) {
+                // Canonical on both sides: a lexical prefix test misses a parent
+                // directory swapped for a symlink between the scan and the removal.
+                let within = match (fs::canonicalize(&dir.path), fs::canonicalize(&plan.path)) {
+                    (Ok(dir), Ok(project)) => dir.starts_with(project),
+                    _ => false,
+                };
+                if !within {
                     errors.push(format!("{}: outside project, skipped", dir.path.display()));
                     continue;
                 }
