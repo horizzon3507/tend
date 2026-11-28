@@ -118,8 +118,16 @@ pub struct CleanArgs {
     /// (npm install / cargo build restore them). Tool installs
     /// (~/.bun/install, ~/.cargo/registry, ~/.local/opt, ~/.npm, ~/.nvm,
     /// go/pkg/mod, pnpm, plugins) are never listed and never touched.
+    ///
+    /// Removals move to the trash first: `tend trash restore` undoes a mistake
+    /// and `tend trash empty` reclaims the space for good. --purge skips the
+    /// trash and deletes permanently in one step.
     #[arg(long, verbatim_doc_comment)]
     pub apply: bool,
+
+    /// delete permanently in one step, skipping the trash
+    #[arg(long)]
+    pub purge: bool,
 
     /// skip the confirmation prompt
     #[arg(long)]

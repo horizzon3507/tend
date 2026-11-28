@@ -167,6 +167,7 @@ pub fn run(args: CleanArgs) -> Result<i32> {
         let document = json!({
             "roots": roots.iter().map(|root| root.display().to_string()).collect::<Vec<_>>(),
             "apply": args.apply,
+            "mode": if args.purge { "purge" } else { "trash" },
             "truncated": report.truncated,
             "olderThan": args.older_than,
             "minSize": args.min_size,
@@ -203,7 +204,12 @@ pub fn run(args: CleanArgs) -> Result<i32> {
 
         if !args.yes
             && !confirm(&format!(
-                "  delete {} directories ({})? [y/N] ",
+                "  {} {} directories ({})? [y/N] ",
+                if args.purge {
+                    "permanently delete"
+                } else {
+                    "move to the trash"
+                },
                 eligible.len(),
                 human_bytes(total)
             ))
@@ -213,16 +219,21 @@ pub fn run(args: CleanArgs) -> Result<i32> {
             return Ok(1);
         }
 
-        let (removed, freed, errors) = delete_all(&eligible, true);
+        let (removed, freed, errors) = delete_all(&eligible, true, args.purge);
         history::record("clean", &roots, removed, freed, errors.len());
         let code = if errors.is_empty() { 0 } else { 1 };
         emit(Some((removed, freed, &errors)))?;
         return Ok(code);
     } else {
         ui::section("tend", Some("cleanup"));
-        if args.apply {
+        if args.apply && args.purge {
             ui::say_warn(&format!(
-                "destructive mode, {} will be removed",
+                "purge mode, {} will be permanently deleted",
+                ui::bold(&human_bytes(total))
+            ));
+        } else if args.apply {
+            ui::say_warn(&format!(
+                "{} moves to the trash (restorable)",
                 ui::bold(&human_bytes(total))
             ));
         } else {
@@ -285,8 +296,9 @@ pub fn run(args: CleanArgs) -> Result<i32> {
 
     if !args.apply {
         ui::say_info(&format!(
-            "to really delete: {}",
-            ui::bold("tend clean --apply")
+            "to really delete: {} (moves to the trash; {} deletes permanently)",
+            ui::bold("tend clean --apply"),
+            ui::bold("--purge")
         ));
         return Ok(0);
     }
@@ -298,7 +310,12 @@ pub fn run(args: CleanArgs) -> Result<i32> {
 
     if !args.yes
         && !confirm(&format!(
-            "  delete {} directories ({})? [y/N] ",
+            "  {} {} directories ({})? [y/N] ",
+            if args.purge {
+                "permanently delete"
+            } else {
+                "move to the trash"
+            },
             eligible.len(),
             human_bytes(total)
         ))
@@ -307,13 +324,25 @@ pub fn run(args: CleanArgs) -> Result<i32> {
         return Ok(1);
     }
 
-    let (removed, freed, errors) = delete_all(&eligible, false);
+    let (removed, freed, errors) = delete_all(&eligible, false, args.purge);
     history::record("clean", &roots, removed, freed, errors.len());
     ui::blank();
-    ui::say_ok(&format!(
-        "{removed} directories removed, {} freed",
-        ui::bold(&human_bytes(freed))
-    ));
+    if args.purge {
+        ui::say_ok(&format!(
+            "{removed} directories removed, {} freed",
+            ui::bold(&human_bytes(freed))
+        ));
+    } else {
+        ui::say_ok(&format!(
+            "{removed} directories moved to the trash, {} cleared",
+            ui::bold(&human_bytes(freed))
+        ));
+        ui::say_info(&format!(
+            "undo with {}, reclaim with {}",
+            ui::bold("tend trash restore latest"),
+            ui::bold("tend trash empty")
+        ));
+    }
     for error in errors.iter().take(5) {
         ui::say_fail(error);
     }
@@ -324,7 +353,8 @@ pub fn run(args: CleanArgs) -> Result<i32> {
 /// runs: it must still be a real directory (not a symlink swapped in after the
 /// scan) and still sit outside the protected tool-install prefixes.
 fn revalidate(path: &Path) -> Result<(), String> {
-    let meta = fs::symlink_metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let meta =
+        fs::symlink_metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
     if meta.file_type().is_symlink() {
         return Err(format!("{}: skipped symlink", path.display()));
     }
@@ -332,14 +362,21 @@ fn revalidate(path: &Path) -> Result<(), String> {
         return Err(format!("{}: no longer a directory", path.display()));
     }
     if targets::is_protected(path) {
-        return Err(format!("{}: protected tool install, skipped", path.display()));
+        return Err(format!(
+            "{}: protected tool install, skipped",
+            path.display()
+        ));
     }
     Ok(())
 }
 
 /// Removes each planned directory. `quiet` suppresses the per-item line, which the
 /// JSON mode does not need.
-fn delete_all(eligible: &[&crate::scan::Finding], quiet: bool) -> (usize, u64, Vec<String>) {
+fn delete_all(
+    eligible: &[&crate::scan::Finding],
+    quiet: bool,
+    purge: bool,
+) -> (usize, u64, Vec<String>) {
     let mut freed = 0u64;
     let mut removed = 0usize;
     let mut errors: Vec<String> = Vec::new();
@@ -349,7 +386,12 @@ fn delete_all(eligible: &[&crate::scan::Finding], quiet: bool) -> (usize, u64, V
             errors.push(reason);
             continue;
         }
-        match fs::remove_dir_all(&finding.path) {
+        let outcome = if purge {
+            fs::remove_dir_all(&finding.path).map(|_| ())
+        } else {
+            crate::trash::move_to_trash(&finding.path, finding.bytes, "clean").map(|_| ())
+        };
+        match outcome {
             Ok(()) => {
                 freed += finding.bytes;
                 removed += 1;
