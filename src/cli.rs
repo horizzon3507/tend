@@ -46,6 +46,8 @@ pub enum Command {
     History(HistoryArgs),
     /// report space held by docker, journald, and the user cache
     Space(SpaceArgs),
+    /// inspect, restore, or empty the trash
+    Trash(TrashArgs),
     /// print a shell completion script
     Completions(CompletionsArgs),
     /// print the man page as roff
@@ -187,6 +189,33 @@ pub struct HistoryArgs {
 }
 
 #[derive(Args, Debug)]
+pub struct TrashArgs {
+    #[command(subcommand)]
+    pub action: Option<TrashAction>,
+
+    /// JSON output, for scripts
+    #[arg(long, global = true)]
+    pub json: bool,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum TrashAction {
+    /// list what is in the trash (default)
+    List,
+    /// put an item back where it came from (id, id prefix, or "latest")
+    Restore { reference: Option<String> },
+    /// permanently delete trashed items
+    Empty {
+        /// only delete items trashed at least this many days ago
+        #[arg(long = "older-than", value_name = "DAYS")]
+        older_than: Option<i64>,
+        /// skip the confirmation prompt
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Args, Debug)]
 pub struct SpaceArgs {
     /// JSON output, for scripts
     #[arg(long)]
@@ -280,6 +309,7 @@ pub fn run(cli: Cli) -> Result<i32> {
         Command::Check(args) => commands::check::run(args),
         Command::History(args) => commands::history::run(args),
         Command::Space(args) => commands::space::run(args),
+        Command::Trash(args) => commands::trash::run(args),
         Command::Completions(args) => commands::completions::run(args),
         Command::Man(args) => commands::man::run(args),
     }

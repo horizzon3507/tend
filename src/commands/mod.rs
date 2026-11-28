@@ -9,6 +9,7 @@ pub mod projects;
 pub mod scan;
 pub mod space;
 pub mod status;
+pub mod trash;
 pub mod watch;
 
 use std::path::PathBuf;
