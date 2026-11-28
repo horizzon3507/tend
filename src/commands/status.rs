@@ -56,6 +56,7 @@ pub fn run(args: StatusArgs) -> Result<i32> {
                 "linksCapped": report.links_capped,
                 "protectedPaths": report.protected_paths.len(),
                 "backups": backups.len(),
+                "trash": crate::trash::total_bytes(),
                 "lastBackup": last.map(|manifest| manifest.created_at),
                 "configPath": config::config_path().display().to_string(),
                 "dataDir": config::data_dir().display().to_string(),
@@ -126,6 +127,18 @@ pub fn run(args: StatusArgs) -> Result<i32> {
             ui::warn(&link_text)
         },
     );
+
+    let trashed = crate::trash::total_bytes();
+    if trashed > 0 {
+        ui::kv(
+            "trash",
+            &format!(
+                "{} {}",
+                ui::brand(&human_bytes(trashed)),
+                ui::dim("held, tend trash empty reclaims it")
+            ),
+        );
+    }
 
     if !report.biggest.is_empty() {
         ui::blank();
