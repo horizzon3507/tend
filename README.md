@@ -49,7 +49,7 @@ history (`git show ed9e552:src/cli.ts`).
 | `tend status` | overview: disk, reclaimable space, backup, and links |
 | `tend scan` | full scan: biggest directories, junk, repos, broken links |
 | `tend clean` | moves caches and builds to the trash (`--purge` deletes outright). Dry run by default |
-| `tend projects [PATH]` | per-project artifact cleanup: finds projects under PATH (default `.`), lists `target/`, `node_modules/`, `.next/`, `dist/`, `build/`, `__pycache__/`, `.venv`/`venv`. Dry run by default |
+| `tend projects [PATH]` | per-project artifact cleanup: finds projects under PATH (default `.`), lists `target/`, `node_modules/`, `.next/`, `dist/`, `build/`, `__pycache__/`, `.venv`/`venv`, `.dart_tool`, `.zig-cache`, `zig-out`. Dry run by default |
 | `tend check` | disk pressure check: prints usage and exits `2` when it reaches `--max-usage` (default 90%). `--quiet` prints nothing and only sets the exit code |
 | `tend history` | shows what previous cleanup runs freed (`--limit`, default 20; `--json`) |
 | `tend trash` | lists what is in the trash: id, size, age, origin path |
