@@ -6,6 +6,7 @@ mod history;
 mod monitor;
 mod scan;
 mod targets;
+mod trash;
 mod ui;
 mod util;
 
