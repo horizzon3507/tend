@@ -233,6 +233,15 @@ fn restore_in(base: &Path, reference: &str) -> std::io::Result<PathBuf> {
         ));
     };
     let dest = PathBuf::from(&entry.original_path);
+    // The manifest is a local file: a tampered or corrupted line must not turn a
+    // restore into a write to a top-level or protected tool-install path.
+    if dest == Path::new("/") || dest == crate::util::home() || crate::targets::is_protected(&dest)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("refusing to restore over {}", dest.display()),
+        ));
+    }
     if dest.exists() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
@@ -467,6 +476,28 @@ mod tests {
         let dst = tmp.path().join("dst");
         assert!(copy_tree(&src, &dst).is_err());
         assert!(src.join("nested/blob.bin").exists(), "original stays");
+    }
+
+    #[test]
+    fn restore_refuses_a_tampered_top_level_destination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("trash");
+        let work = tmp.path().join("work");
+        fs::create_dir_all(&work).unwrap();
+        let dir = filled_dir(&work, "target");
+
+        let mut entry = move_to_trash_in(&base, &dir, 100, "clean").unwrap();
+        entry.original_path = "/".to_string();
+        // rewrite the manifest with the forged destination
+        fs::write(
+            manifest_path_in(&base),
+            format!("{}\n", serde_json::to_string(&entry).unwrap()),
+        )
+        .unwrap();
+
+        let error = restore_in(&base, "latest").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(items_dir_in(&base).join(&entry.stored).exists());
     }
 
     #[test]
