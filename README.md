@@ -34,7 +34,7 @@ install -m755 target/release/tend ~/.cargo/bin/tend
 tend status
 ```
 
-The Cargo package is `tend-cli` (version `0.2.0-beta`); the installed binary is
+The Cargo package is `tend-cli` (version `0.3.0-beta`); the installed binary is
 `tend`. Only `git` is required (for the repos part). Scanning, sizes, the tar
 file, and monitoring are pure Rust: no external `du`, `df`, `find`, `tar`, or
 `zstd`.
@@ -48,10 +48,13 @@ history (`git show ed9e552:src/cli.ts`).
 | --- | --- |
 | `tend status` | overview: disk, reclaimable space, backup, and links |
 | `tend scan` | full scan: biggest directories, junk, repos, broken links |
-| `tend clean` | removes caches and builds. Dry run by default |
+| `tend clean` | moves caches and builds to the trash (`--purge` deletes outright). Dry run by default |
 | `tend projects [PATH]` | per-project artifact cleanup: finds projects under PATH (default `.`), lists `target/`, `node_modules/`, `.next/`, `dist/`, `build/`, `__pycache__/`, `.venv`/`venv`. Dry run by default |
 | `tend check` | disk pressure check: prints usage and exits `2` when it reaches `--max-usage` (default 90%). `--quiet` prints nothing and only sets the exit code |
 | `tend history` | shows what previous cleanup runs freed (`--limit`, default 20; `--json`) |
+| `tend trash` | lists what is in the trash: id, size, age, origin path |
+| `tend trash restore [id]` | puts an item back where it came from (`latest` by default; never overwrites) |
+| `tend trash empty` | permanently deletes trashed items, after confirmation (`--older-than N`, `--yes`) |
 | `tend space` | reports space held by docker, journald, and the user cache (`~/.cache`). Read-only |
 | `tend backup` | dotfile snapshot, with rotation |
 | `tend backup list` | lists the stored snapshots |
@@ -68,8 +71,12 @@ history (`git show ed9e552:src/cli.ts`).
 tend scan --depth 3 --top 6        # faster, less noise
 tend scan --limit 50               # list at most 50 findings; totals stay complete
 tend clean --all                   # include unsafe targets (.venv, dist, build)
-tend clean --apply                 # really delete, asks for confirmation
-tend clean --apply --yes           # delete without asking
+tend clean --apply                 # move targets to the trash, asks for confirmation
+tend clean --apply --yes           # move to the trash without asking
+tend clean --apply --purge         # skip the trash, delete permanently
+tend trash                        # what is in the trash right now
+tend trash restore latest         # undo the last removal
+tend trash empty --older-than 7   # reclaim items trashed a week ago
 tend clean --older-than 30 --min-size 100MB   # only old, large targets
 tend projects ~/code --depth 2     # search below ~/code as well as its immediate children
 tend projects --apply                # delete, asks once: Remove <kinds> from <n> projects (X)? [y/N]
@@ -224,6 +231,12 @@ Verified on this machine, not claimed:
   lists zero targets under `~/.cache`, and `~/.gradle` appears only in
   `protectedPaths`. `scan --limit 1` reports the same `reclaimable` as an
   unlimited scan, with `totalFindings` intact.
+- **v0.3.0 reversible cleanup**: in a scratch HOME, `clean --apply --yes` moved
+  `target/` and `node_modules/` into the trash store (nothing left behind),
+  `trash restore latest` put the item back (a same-filesystem move, contents
+  and symlinks untouched), `trash empty --yes`
+  reclaimed the space, and `--purge` deleted permanently with the store
+  untouched. `trash restore` over an existing path refuses and keeps the item.
 - **v0.2.0 destructive safety**: `projects --apply` on piped stdin cancels
   with exit 1 and deletes nothing; `--yes` then removes the artifact and keeps
   `src/`. `clean --apply` on piped stdin also cancels. `check --quiet` exits 2
