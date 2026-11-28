@@ -25,6 +25,8 @@ const NO_DESCEND: &[&str] = &[
     "__pycache__",
     ".venv",
     "venv",
+    ".dart_tool",
+    ".zig-cache",
     ".git",
 ];
 
@@ -140,9 +142,25 @@ const KINDS: &[KindDef] = &[
         dirs: &[".venv", "venv"],
         safe: false,
     },
+    KindDef {
+        kind: "dart_tool",
+        dirs: &[".dart_tool"],
+        safe: true,
+    },
+    KindDef {
+        kind: "zig-cache",
+        dirs: &[".zig-cache"],
+        safe: true,
+    },
+    KindDef {
+        kind: "zig-out",
+        dirs: &["zig-out"],
+        safe: false,
+    },
 ];
 
-const VALID_KINDS: &str = "target, node_modules, next, dist, build, pycache, venv";
+const VALID_KINDS: &str =
+    "target, node_modules, next, dist, build, pycache, venv, dart_tool, zig-cache, zig-out";
 
 struct KindEntry {
     kind: &'static str,
@@ -178,6 +196,9 @@ fn canonical_kind(item: &str) -> Option<&'static str> {
         "build" => Some("build"),
         "pycache" | "__pycache__" => Some("pycache"),
         "venv" => Some("venv"),
+        "dart_tool" | "dart-tool" | "dart" => Some("dart_tool"),
+        "zig-cache" | "zigcache" => Some("zig-cache"),
+        "zig-out" | "zigout" => Some("zig-out"),
         _ => None,
     }
 }
