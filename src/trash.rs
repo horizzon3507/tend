@@ -203,18 +203,26 @@ pub fn total_bytes() -> u64 {
     list().iter().map(|entry| entry.bytes).sum()
 }
 
-/// Finds one entry by id, id prefix, or "latest".
-fn find_entry(entries: &[TrashEntry], reference: &str) -> Option<TrashEntry> {
+/// Finds one entry by id, id prefix, or "latest". An ambiguous prefix is an
+/// error with a distinct message, not a silent no-match.
+fn find_entry(entries: &[TrashEntry], reference: &str) -> Result<TrashEntry, String> {
     if reference == "latest" {
-        return entries.first().cloned();
+        return entries
+            .first()
+            .cloned()
+            .ok_or_else(|| "the trash is empty".to_string());
     }
     let matches: Vec<&TrashEntry> = entries
         .iter()
         .filter(|entry| entry.id == reference || entry.id.starts_with(reference))
         .collect();
     match matches.len() {
-        1 => Some(matches[0].clone()),
-        _ => None,
+        1 => Ok(matches[0].clone()),
+        0 => Err(format!("no trash item matches '{reference}'")),
+        _ => Err(format!(
+            "'{reference}' matches {} items, be more specific",
+            matches.len()
+        )),
     }
 }
 
@@ -226,12 +234,8 @@ pub fn restore(reference: &str) -> std::io::Result<PathBuf> {
 
 fn restore_in(base: &Path, reference: &str) -> std::io::Result<PathBuf> {
     let entries = list_in(base);
-    let Some(entry) = find_entry(&entries, reference) else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("no trash item matches '{reference}'"),
-        ));
-    };
+    let entry = find_entry(&entries, reference)
+        .map_err(|msg| std::io::Error::new(std::io::ErrorKind::NotFound, msg))?;
     let dest = PathBuf::from(&entry.original_path);
     // The manifest is a local file: a tampered or corrupted line must not turn a
     // restore into a write to a top-level or protected tool-install path.
