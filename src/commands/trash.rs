@@ -125,6 +125,9 @@ fn empty(args: &TrashArgs, older_than: Option<i64>, yes: bool) -> Result<i32> {
     }
 
     let (removed, freed, errors) = trash::empty(older_than);
+    // The space is really reclaimed here, not when the item was trashed, so
+    // this is the run the history should credit.
+    crate::history::record("trash-empty", &[], removed, freed, errors.len());
     if args.json {
         println!(
             "{}",
