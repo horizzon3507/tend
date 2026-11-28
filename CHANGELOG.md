@@ -38,6 +38,7 @@ Reversible cleanup: the trash. This version was made for CLI with a beta release
 - Trash moves are atomic renames on the same filesystem and symlink-preserving copies across filesystems; the original only disappears after the payload is fully inside the store. The append-only manifest is best effort, like the history: the payload on disk is the source of truth.
 - `clean` revalidates every path right before removal (still a real directory, not a symlink swapped in after the scan, outside the protected tool installs), matching the check `projects` already ran.
 - `tend status` shows the space held in the trash, so a cleanup that only moved bytes is not mistaken for reclaimed disk; `--json` gains a `trash` field.
+- Removal hardening: `clean` and `projects` canonicalize before deleting, so a parent directory swapped for a symlink after the scan cannot smuggle an outside tree into the plan; the trash store ignores forged manifest entries, refuses top-level paths and symlinks, cleans up partial cross-filesystem copies, and refuses restores to top-level or protected destinations.
 - New collection targets: safe `.dart_tool`, `.zig-cache`, `.expo`, and `.angular`; unsafe `zig-out` and `coverage`, matching the existing dist/build caution. `tend projects` learns the `dart_tool`, `zig-cache`, and `zig-out` kinds with `--only`/`--except` aliases.
 - `tend history` credits reclaimed space when the trash is emptied (`trash-empty` entries), because that is when the disk is really freed, and `tend space` lists the trash next to docker, journald, and the user cache.
 
