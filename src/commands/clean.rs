@@ -423,6 +423,31 @@ mod tests {
     }
 
     #[test]
+    fn revalidate_accepts_a_real_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("target");
+        fs::create_dir(&dir).unwrap();
+        assert!(revalidate(&dir).is_ok());
+    }
+
+    #[test]
+    fn revalidate_rejects_a_symlink_swapped_in_after_the_scan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let link = tmp.path().join("node_modules");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let error = revalidate(&link).unwrap_err();
+        assert!(error.contains("symlink"));
+    }
+
+    #[test]
+    fn revalidate_rejects_what_disappeared() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(revalidate(&tmp.path().join("gone")).is_err());
+    }
+
+    #[test]
     fn rejects_negative_age_and_bad_sizes() {
         assert!(Filters::new(Some(-1), None).is_err());
         assert!(Filters::new(None, Some("ten megabytes".to_string())).is_err());
