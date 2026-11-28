@@ -320,6 +320,23 @@ pub fn run(args: CleanArgs) -> Result<i32> {
     Ok(if errors.is_empty() { 0 } else { 1 })
 }
 
+/// Re-validates one path right before removal, the same double check `projects`
+/// runs: it must still be a real directory (not a symlink swapped in after the
+/// scan) and still sit outside the protected tool-install prefixes.
+fn revalidate(path: &Path) -> Result<(), String> {
+    let meta = fs::symlink_metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    if meta.file_type().is_symlink() {
+        return Err(format!("{}: skipped symlink", path.display()));
+    }
+    if !meta.is_dir() {
+        return Err(format!("{}: no longer a directory", path.display()));
+    }
+    if targets::is_protected(path) {
+        return Err(format!("{}: protected tool install, skipped", path.display()));
+    }
+    Ok(())
+}
+
 /// Removes each planned directory. `quiet` suppresses the per-item line, which the
 /// JSON mode does not need.
 fn delete_all(eligible: &[&crate::scan::Finding], quiet: bool) -> (usize, u64, Vec<String>) {
@@ -328,6 +345,10 @@ fn delete_all(eligible: &[&crate::scan::Finding], quiet: bool) -> (usize, u64, V
     let mut errors: Vec<String> = Vec::new();
 
     for finding in eligible {
+        if let Err(reason) = revalidate(&finding.path) {
+            errors.push(reason);
+            continue;
+        }
         match fs::remove_dir_all(&finding.path) {
             Ok(()) => {
                 freed += finding.bytes;
