@@ -85,6 +85,30 @@ pub const TARGETS: &[Target] = &[
         note: "build cache only",
     },
     Target {
+        name: ".dart_tool",
+        label: "Dart/Flutter tool state",
+        safe: true,
+        note: "dart pub get recreates it",
+    },
+    Target {
+        name: ".zig-cache",
+        label: "Zig build cache",
+        safe: true,
+        note: "zig build recreates it",
+    },
+    Target {
+        name: ".expo",
+        label: "Expo bundler cache",
+        safe: true,
+        note: "recreated on dev/build",
+    },
+    Target {
+        name: ".angular",
+        label: "Angular CLI cache",
+        safe: true,
+        note: "build cache only",
+    },
+    Target {
         name: ".venv",
         label: "Python virtualenv",
         safe: false,
@@ -107,6 +131,18 @@ pub const TARGETS: &[Target] = &[
         label: "build directory",
         safe: false,
         note: "may contain published artifacts",
+    },
+    Target {
+        name: "zig-out",
+        label: "Zig output",
+        safe: false,
+        note: "may contain published artifacts",
+    },
+    Target {
+        name: "coverage",
+        label: "coverage reports",
+        safe: false,
+        note: "regenerable, but may hold reports you keep",
     },
 ];
 
