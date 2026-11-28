@@ -219,7 +219,7 @@ pub fn run(args: CleanArgs) -> Result<i32> {
             return Ok(1);
         }
 
-        let (removed, freed, errors) = delete_all(&eligible, true, args.purge);
+        let (removed, freed, errors) = delete_all(&eligible, true, args.purge, &roots);
         history::record("clean", &roots, removed, freed, errors.len());
         let code = if errors.is_empty() { 0 } else { 1 };
         emit(Some((removed, freed, &errors)))?;
@@ -324,7 +324,7 @@ pub fn run(args: CleanArgs) -> Result<i32> {
         return Ok(1);
     }
 
-    let (removed, freed, errors) = delete_all(&eligible, false, args.purge);
+    let (removed, freed, errors) = delete_all(&eligible, false, args.purge, &roots);
     history::record("clean", &roots, removed, freed, errors.len());
     ui::blank();
     if args.purge {
@@ -350,9 +350,12 @@ pub fn run(args: CleanArgs) -> Result<i32> {
 }
 
 /// Re-validates one path right before removal, the same double check `projects`
-/// runs: it must still be a real directory (not a symlink swapped in after the
-/// scan) and still sit outside the protected tool-install prefixes.
-fn revalidate(path: &Path) -> Result<(), String> {
+/// runs, plus one more: it must still be a real directory (not a symlink swapped
+/// in after the scan), still sit outside the protected tool-install prefixes,
+/// and still resolve inside a scanned root. The last check is canonical because
+/// a lexical prefix test misses a parent directory that was replaced by a
+/// symlink between the scan and the removal.
+fn revalidate(path: &Path, roots: &[PathBuf]) -> Result<(), String> {
     let meta =
         fs::symlink_metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
     if meta.file_type().is_symlink() {
@@ -367,6 +370,19 @@ fn revalidate(path: &Path) -> Result<(), String> {
             path.display()
         ));
     }
+    let canonical =
+        fs::canonicalize(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let inside = roots.iter().any(|root| {
+        fs::canonicalize(root)
+            .map(|root| canonical.starts_with(root))
+            .unwrap_or(false)
+    });
+    if !inside {
+        return Err(format!(
+            "{}: resolves outside the scanned roots, skipped",
+            path.display()
+        ));
+    }
     Ok(())
 }
 
@@ -376,13 +392,14 @@ fn delete_all(
     eligible: &[&crate::scan::Finding],
     quiet: bool,
     purge: bool,
+    roots: &[PathBuf],
 ) -> (usize, u64, Vec<String>) {
     let mut freed = 0u64;
     let mut removed = 0usize;
     let mut errors: Vec<String> = Vec::new();
 
     for finding in eligible {
-        if let Err(reason) = revalidate(&finding.path) {
+        if let Err(reason) = revalidate(&finding.path, roots) {
             errors.push(reason);
             continue;
         }
@@ -427,7 +444,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("target");
         fs::create_dir(&dir).unwrap();
-        assert!(revalidate(&dir).is_ok());
+        assert!(revalidate(&dir, &[tmp.path().to_path_buf()]).is_ok());
     }
 
     #[test]
@@ -437,14 +454,36 @@ mod tests {
         fs::create_dir(&real).unwrap();
         let link = tmp.path().join("node_modules");
         std::os::unix::fs::symlink(&real, &link).unwrap();
-        let error = revalidate(&link).unwrap_err();
+        let error = revalidate(&link, &[tmp.path().to_path_buf()]).unwrap_err();
         assert!(error.contains("symlink"));
     }
 
     #[test]
     fn revalidate_rejects_what_disappeared() {
         let tmp = tempfile::tempdir().unwrap();
-        assert!(revalidate(&tmp.path().join("gone")).is_err());
+        assert!(revalidate(&tmp.path().join("gone"), &[tmp.path().to_path_buf()]).is_err());
+    }
+
+    #[test]
+    fn revalidate_catches_a_parent_swapped_for_a_symlink() {
+        // The plan named root/proj/target; between the scan and the removal,
+        // proj became a symlink to somewhere outside the scanned root.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let elsewhere = tmp.path().join("elsewhere");
+        fs::create_dir_all(root.join("proj/target")).unwrap();
+        fs::create_dir_all(elsewhere.join("target")).unwrap();
+        let planned = root.join("proj/target");
+
+        fs::remove_dir_all(root.join("proj")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, root.join("proj")).unwrap();
+
+        let error = revalidate(&planned, std::slice::from_ref(&root)).unwrap_err();
+        assert!(error.contains("outside the scanned roots"));
+        assert!(
+            elsewhere.join("target").exists(),
+            "nothing outside is touched"
+        );
     }
 
     #[test]
