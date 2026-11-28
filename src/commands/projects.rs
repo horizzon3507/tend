@@ -65,8 +65,16 @@ pub struct ProjectsArgs {
     pub min_size: Option<String>,
 
     /// actually delete (default is a dry run that deletes nothing)
-    #[arg(long)]
+    ///
+    /// Removals move to the trash first: `tend trash restore` undoes a mistake
+    /// and `tend trash empty` reclaims the space for good. --purge skips the
+    /// trash and deletes permanently in one step.
+    #[arg(long, verbatim_doc_comment)]
     pub apply: bool,
+
+    /// delete permanently in one step, skipping the trash
+    #[arg(long)]
+    pub purge: bool,
 
     /// skip the confirmation prompt
     #[arg(long)]
@@ -489,7 +497,7 @@ fn confirm(question: &str) -> bool {
 /// One prompt for the whole run after the plan has been shown. `--yes` skips it;
 /// a non-interactive stdin is refused instead of auto-confirmed, so a piped run
 /// can never delete without an explicit `--yes`.
-fn confirmed(plans: &[ProjectPlan], total: u64, yes: bool, tty: bool) -> bool {
+fn confirmed(plans: &[ProjectPlan], total: u64, yes: bool, tty: bool, purge: bool) -> bool {
     if yes {
         return true;
     }
@@ -499,7 +507,12 @@ fn confirmed(plans: &[ProjectPlan], total: u64, yes: bool, tty: bool) -> bool {
     }
     let kinds = distinct_kinds(plans).join(", ");
     confirm(&format!(
-        "Remove {kinds} from {} projects ({})? [y/N] ",
+        "{} {kinds} from {} projects ({})? [y/N] ",
+        if purge {
+            "Permanently delete"
+        } else {
+            "Move to the trash"
+        },
         plans.len(),
         human_bytes(total)
     ))
@@ -607,7 +620,7 @@ fn print_plan(
 /// before removal: it must still be a real directory (not a symlink), still
 /// sit inside its project, and still fall outside the protected tool-install
 /// prefixes.
-fn delete_all(plans: &[ProjectPlan], quiet: bool) -> (usize, u64, Vec<String>) {
+fn delete_all(plans: &[ProjectPlan], quiet: bool, purge: bool) -> (usize, u64, Vec<String>) {
     let mut removed = 0usize;
     let mut freed = 0u64;
     let mut errors: Vec<String> = Vec::new();
@@ -636,7 +649,12 @@ fn delete_all(plans: &[ProjectPlan], quiet: bool) -> (usize, u64, Vec<String>) {
                 if is_protected(&dir.path) {
                     continue;
                 }
-                match fs::remove_dir_all(&dir.path) {
+                let outcome = if purge {
+                    fs::remove_dir_all(&dir.path).map(|_| ())
+                } else {
+                    crate::trash::move_to_trash(&dir.path, dir.bytes, "projects").map(|_| ())
+                };
+                match outcome {
                     Ok(()) => {
                         removed += 1;
                         freed += dir.bytes;
@@ -709,12 +727,12 @@ pub fn run(args: ProjectsArgs) -> Result<i32> {
             emit_json(&root, &args, &actionable, Some((0, 0, &[])))?;
             return Ok(0);
         }
-        if !confirmed(&actionable, total, args.yes, interactive) {
+        if !confirmed(&actionable, total, args.yes, interactive, args.purge) {
             emit_json(&root, &args, &actionable, Some((0, 0, &[])))?;
             eprintln!("cancelled, nothing was removed");
             return Ok(1);
         }
-        let (removed, freed, errors) = delete_all(&actionable, true);
+        let (removed, freed, errors) = delete_all(&actionable, true, args.purge);
         history::record(
             "projects",
             std::slice::from_ref(&root),
@@ -735,22 +753,30 @@ pub fn run(args: ProjectsArgs) -> Result<i32> {
 
     if !args.apply {
         ui::say_info(&format!(
-            "dry run, nothing was removed: {}",
-            ui::bold("rerun with --apply to delete")
+            "dry run, nothing was removed: {} (moves to the trash; {} deletes permanently)",
+            ui::bold("rerun with --apply"),
+            ui::bold("--purge")
         ));
         return Ok(0);
     }
 
-    ui::say_warn(&format!(
-        "destructive mode, {} will be removed",
-        ui::bold(&human_bytes(total))
-    ));
-    if !confirmed(&actionable, total, args.yes, interactive) {
+    if args.purge {
+        ui::say_warn(&format!(
+            "purge mode, {} will be permanently deleted",
+            ui::bold(&human_bytes(total))
+        ));
+    } else {
+        ui::say_warn(&format!(
+            "{} moves to the trash (restorable)",
+            ui::bold(&human_bytes(total))
+        ));
+    }
+    if !confirmed(&actionable, total, args.yes, interactive, args.purge) {
         ui::say_fail("cancelled, nothing was removed");
         return Ok(1);
     }
 
-    let (removed, freed, errors) = delete_all(&actionable, false);
+    let (removed, freed, errors) = delete_all(&actionable, false, args.purge);
     history::record(
         "projects",
         std::slice::from_ref(&root),
@@ -759,10 +785,22 @@ pub fn run(args: ProjectsArgs) -> Result<i32> {
         errors.len(),
     );
     ui::blank();
-    ui::say_ok(&format!(
-        "{removed} directories removed, {} freed",
-        ui::bold(&human_bytes(freed))
-    ));
+    if args.purge {
+        ui::say_ok(&format!(
+            "{removed} directories removed, {} freed",
+            ui::bold(&human_bytes(freed))
+        ));
+    } else {
+        ui::say_ok(&format!(
+            "{removed} directories moved to the trash, {} cleared",
+            ui::bold(&human_bytes(freed))
+        ));
+        ui::say_info(&format!(
+            "undo with {}, reclaim with {}",
+            ui::bold("tend trash restore latest"),
+            ui::bold("tend trash empty")
+        ));
+    }
     for error in errors.iter().take(5) {
         ui::say_fail(error);
     }
@@ -784,6 +822,7 @@ mod tests {
             older_than: None,
             min_size: None,
             apply: false,
+            purge: false,
             yes: true,
             json: false,
         }
@@ -1041,7 +1080,7 @@ mod tests {
 
     #[test]
     fn non_interactive_apply_requires_yes() {
-        assert!(!confirmed(&[], 0, false, false));
-        assert!(confirmed(&[], 0, true, false));
+        assert!(!confirmed(&[], 0, false, false, false));
+        assert!(confirmed(&[], 0, true, false, false));
     }
 }
