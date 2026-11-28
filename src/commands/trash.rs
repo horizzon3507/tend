@@ -53,15 +53,17 @@ fn list(args: &TrashArgs) -> Result<i32> {
     );
     ui::blank();
     for entry in &entries {
+        let age = now_ms() - entry.trashed_at;
+        let age_text = if age < 60_000 {
+            "just now".to_string()
+        } else {
+            format!("{} ago", human_age(age))
+        };
         println!(
             "  {}  {}  {}  {}",
-            ui::dim(&entry.id[..12.min(entry.id.len())]),
+            ui::dim(&entry.id),
             ui::bold(&ui::pad_visible(&human_bytes(entry.bytes), 9, true)),
-            ui::grey(&format!(
-                "{} ago · {}",
-                human_age(now_ms() - entry.trashed_at),
-                entry.source
-            )),
+            ui::grey(&format!("{age_text} · {}", entry.source)),
             tildify(std::path::Path::new(&entry.original_path)),
         );
     }
