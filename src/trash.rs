@@ -53,13 +53,17 @@ fn short_hash(path: &Path) -> String {
 }
 
 /// Moves a directory without following symlinks: rename when both sides share a
-/// filesystem (atomic), otherwise a symlink-preserving copy. Only the caller
-/// removes the original after a successful copy.
+/// filesystem (atomic), otherwise a symlink-preserving copy. A failed copy
+/// deletes the partial destination and leaves the original untouched: a half
+/// moved tree is never reported as trashed.
 fn move_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
     match fs::rename(src, dst) {
         Ok(()) => Ok(()),
         Err(error) if error.raw_os_error() == Some(libc::EXDEV) => {
-            copy_tree(src, dst)?;
+            if let Err(copy_error) = copy_tree(src, dst) {
+                let _ = fs::remove_dir_all(dst);
+                return Err(copy_error);
+            }
             fs::remove_dir_all(src)
         }
         Err(error) => Err(error),
@@ -104,12 +108,50 @@ pub fn move_to_trash(path: &Path, bytes: u64, source: &str) -> std::io::Result<T
     move_to_trash_in(&trash_dir(), path, bytes, source)
 }
 
+/// Paths that must never enter the trash, whatever the caller decided: the
+/// filesystem root, the user's home, anything without a final name, and
+/// symlinks (moving a link would orphan its target from the manifest's view).
+fn guard_path(path: &Path) -> std::io::Result<()> {
+    if path == Path::new("/") || path == crate::util::home() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("refusing to trash a top-level path: {}", path.display()),
+        ));
+    }
+    if path.file_name().is_none() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("refusing to trash a nameless path: {}", path.display()),
+        ));
+    }
+    let meta = fs::symlink_metadata(path)?;
+    if meta.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("refusing to trash a symlink: {}", path.display()),
+        ));
+    }
+    Ok(())
+}
+
+/// A stored payload name must be exactly one normal path component: a tampered
+/// manifest line pointing at "../something" would otherwise move or delete
+/// files outside the store.
+fn valid_stored_name(stored: &str) -> bool {
+    let mut components = Path::new(stored).components();
+    matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    )
+}
+
 fn move_to_trash_in(
     base: &Path,
     path: &Path,
     bytes: u64,
     source: &str,
 ) -> std::io::Result<TrashEntry> {
+    guard_path(path)?;
     let name = path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -149,6 +191,7 @@ fn list_in(base: &Path) -> Vec<TrashEntry> {
     let mut entries: Vec<TrashEntry> = text
         .lines()
         .filter_map(|line| serde_json::from_str(line).ok())
+        .filter(|entry: &TrashEntry| valid_stored_name(&entry.stored))
         .filter(|entry: &TrashEntry| items_dir_in(base).join(&entry.stored).exists())
         .collect();
     entries.reverse();
@@ -337,6 +380,93 @@ mod tests {
         let entry = move_to_trash_in(&base, &dir, 100, "clean").unwrap();
         fs::remove_dir_all(items_dir_in(&base).join(&entry.stored)).unwrap();
         assert!(list_in(&base).is_empty());
+    }
+
+    #[test]
+    fn a_tampered_manifest_line_cannot_escape_the_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("trash");
+        let outside = tmp.path().join("secret");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("keep.txt"), "important").unwrap();
+        fs::create_dir_all(items_dir_in(&base)).unwrap();
+        let forged = serde_json::json!({
+            "id": "1-ffff",
+            "stored": "../../secret",
+            "originalPath": outside.display().to_string(),
+            "trashedAt": now_ms(),
+            "bytes": 1,
+            "source": "clean",
+        });
+        fs::write(
+            manifest_path_in(&base),
+            format!("{}\n", serde_json::to_string(&forged).unwrap()),
+        )
+        .unwrap();
+
+        assert!(list_in(&base).is_empty(), "forged entry is not listed");
+        assert!(restore_in(&base, "latest").is_err());
+        let (removed, _, _) = empty_in(&base, None);
+        assert_eq!(removed, 0);
+        assert!(outside.join("keep.txt").exists(), "nothing outside moves");
+    }
+
+    #[test]
+    fn stored_names_must_be_a_single_component() {
+        assert!(valid_stored_name("123-abcd-target"));
+        assert!(!valid_stored_name("../x"));
+        assert!(!valid_stored_name("a/b"));
+        assert!(!valid_stored_name("/abs"));
+        assert!(!valid_stored_name(".."));
+        assert!(!valid_stored_name(""));
+    }
+
+    #[test]
+    fn the_root_and_home_can_never_be_trashed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("trash");
+        assert!(move_to_trash_in(&base, Path::new("/"), 0, "clean").is_err());
+        assert!(move_to_trash_in(&base, &crate::util::home(), 0, "clean").is_err());
+        assert!(Path::new("/").exists());
+    }
+
+    #[test]
+    fn a_symlink_is_refused_instead_of_moved() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("trash");
+        let real = filled_dir(tmp.path(), "real");
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        assert!(move_to_trash_in(&base, &link, 0, "clean").is_err());
+        assert!(real.join("nested/blob.bin").exists(), "target untouched");
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_copy_leaves_the_original_and_no_partial_copy() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            // root reads through 000 permissions, so the failure cannot be simulated
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let src = filled_dir(tmp.path(), "src");
+        fs::set_permissions(
+            src.join("nested/blob.bin"),
+            fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+
+        let dst = tmp.path().join("dst");
+        assert!(copy_tree(&src, &dst).is_err());
+        assert!(src.join("nested/blob.bin").exists(), "original stays");
     }
 
     #[test]
