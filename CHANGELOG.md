@@ -29,6 +29,17 @@ We only call something **stable** when we mean it.
 
 </details>
 
+## v0.3.0-beta · 27/11/2026
+
+Reversible cleanup: the trash. This version was made for CLI with a beta release channel on 27/11/2026 (v0.3.0-beta).
+
+- `tend clean --apply` and `tend projects --apply` move targets into a trash store under the data dir instead of deleting them outright; `--purge` keeps the old one-step permanent deletion.
+- `tend trash` lists the store (id, size, age, source command, origin path); `tend trash restore <id|prefix|latest>` puts an item back and never overwrites; `tend trash empty [--older-than N]` reclaims the space for good after a confirmation.
+- Trash moves are atomic renames on the same filesystem and symlink-preserving copies across filesystems; the original only disappears after the payload is fully inside the store. The append-only manifest is best effort, like the history: the payload on disk is the source of truth.
+- `clean` revalidates every path right before removal (still a real directory, not a symlink swapped in after the scan, outside the protected tool installs), matching the check `projects` already ran.
+- `tend status` shows the space held in the trash, so a cleanup that only moved bytes is not mistaken for reclaimed disk; `--json` gains a `trash` field.
+- New collection targets: safe `.dart_tool`, `.zig-cache`, `.expo`, and `.angular`; unsafe `zig-out` and `coverage`, matching the existing dist/build caution.
+
 ## v0.2.0-beta · 24/10/2026
 
 Safety, correctness, and observability release. This version was made for CLI with a beta release channel on 24/10/2026 (v0.2.0-beta).
